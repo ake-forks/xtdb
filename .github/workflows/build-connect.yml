@@ -25,8 +25,17 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
         with:
           arguments: :modules:xtdb-kafka-connect:shadowJar
+      - name: Generate POM
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          arguments: :modules:xtdb-kafka-connect:generatePomFileForMavenPublication
       - name: Upload Uberjar
         uses: actions/upload-artifact@v4
         with:
-          name: xtdb-kafka-connector
+          name: xtdb-kafka-connector.jar
           path: modules/kafka-connect/build/libs/xtdb-kafka-connect.jar
+      - name: Upload POM
+        uses: actions/upload-artifact@v4
+        with:
+          name: pom-default.xml
+          path: modules/kafka-connect/build/publications/maven/pom-default.xml

@@ -7,10 +7,20 @@ plugins {
     kotlin("jvm")
     signing
     id("com.github.johnrengelman.shadow")
+    `maven-publish`
 }
 
 ext {
     set("labs", true)
+}
+
+publishing {
+    publications.create("maven", MavenPublication::class) {
+        pom {
+            name.set("XTDB Kafka Connect")
+            description.set("XTDB Kafka Connect")
+        }
+    }
 }
 
 java.toolchain.languageVersion.set(JavaLanguageVersion.of(21))
