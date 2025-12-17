@@ -1,5 +1,9 @@
 (ns dev
-  (:require [clojure.java.io :as io]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.pprint :as pp]
+            [clojure.set :as set]
+            [clojure.string :as str]
             [integrant.core :as i]
             [integrant.repl :as ir]
             [xtdb.compactor :as c]
@@ -11,22 +15,18 @@
             [xtdb.test-util :as tu]
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as trie-cat]
-            [xtdb.types :as types]
-            [xtdb.util :as util]
-            [clojure.edn :as edn]
-            [clojure.data :as data]
-            [clojure.set :as set])
+            [xtdb.util :as util])
   (:import [java.nio.file Path]
            java.time.Duration
            [java.util List]
            [org.apache.arrow.memory RootAllocator]
-           [org.apache.arrow.vector.ipc ArrowFileReader]
            org.roaringbitmap.buffer.ImmutableRoaringBitmap
+           [xtdb.api.log Log$Message]
            (xtdb.arrow Relation Vector)
            (xtdb.block.proto TableBlock)
            (xtdb.log.proto TrieDetails)
            (xtdb.trie ArrowHashTrie ArrowHashTrie$IidBranch ArrowHashTrie$Leaf ArrowHashTrie$Node)
-           [xtdb.api.log Log$Message]))
+           (xtdb.trie Trie)))
 
 #_{:clj-kondo/ignore [:unused-namespace :unused-referred-var]}
 (require '[xtdb.logging :refer [set-log-level!]])
@@ -216,8 +216,8 @@
               pbr (java.io.PushbackReader. r)]
     (edn/read {:readers *data-readers*} pbr)))
 
-(def deleted-files (read-diff "./deleted-files.stg.edn"))
-(def trie-diff (read-diff "./trie-diff.stg.edn"))
+(def deleted-files (read-diff "./deleted-files.prd.edn"))
+(def trie-diff (read-diff "./trie-diff.prd.edn"))
 
 ; Are there no duplicate live or garbate tries?
 (reduce #(and %1 %2)
@@ -235,7 +235,7 @@
 ; This means we don't have to reason about things positionally (as they're originally lists)
 
 ; Get the deleted tries
-(def deleted-tries
+(def removed-from-live-tries
   (for [[table trie-diffs] trie-diff
         {{:keys [before after]} :live} trie-diffs
         :let [before (set before)
@@ -245,7 +245,7 @@
     [table deleted]))
 
 ; delted-tries should equal deleted-files
-(= (->> deleted-tries
+(= (->> removed-from-live-tries
         (mapcat (fn [[k vs]]
                   (for [v vs]
                     [k (:trie-key v)])))
@@ -253,6 +253,7 @@
    (->> (:trie-keys deleted-files)
         (sort-by (juxt (comp str first) second))))
 ; => true
+; Uh oh! This is fals on prod!
 
 ; What was move out of garbage?
 (def not-garbage
@@ -267,20 +268,6 @@
 ; - Previoiusly "covered" by the above deleted tries
 ; - Files erroniously marked as garbage without an l3
 
-; There should only be l02h files here
-(->> not-garbage
-     (mapcat (fn [[_ tries]] (map :trie-key tries)))
-     (map trie/parse-trie-key)
-     (remove #(and (= (:level %) 2) (:recency %)))
-     (empty?))
-; => true
-
-; There should be a multipe of 4 of these files per table
-(reduce #(and %1 %2)
-        (for [[table tries] not-garbage]
-          (zero? (mod (count tries) 4))))
-; => true
-
 ; Which files have now been marked as live
 (def new-live
   (for [[table trie-diffs] trie-diff
@@ -293,6 +280,78 @@
 
 ; This should be an exact match for "not-garbage"
 (= not-garbage new-live)
+; => true
+; Uh oh! This is false on prod!
+; These seem to all be l3h files
+; Hypothesis: we have compacted some l3s into l4s and those l3s were still marked as garbage
+
+; Deleted files = deleted tries
+(=
+ (->> (:trie-keys deleted-files)
+      (sort-by (juxt (comp str first) second))
+      set)
+ (set/union
+  (->> removed-from-live-tries
+       (mapcat (fn [[k vs]]
+                 (for [v vs]
+                   [k (:trie-key v)])))
+       (sort-by (juxt (comp str first) second))
+       set)
+  (set/difference
+   (->> not-garbage
+        (mapcat (fn [[k vs]]
+                  (for [v vs]
+                    [k (:trie-key v)])))
+        (sort-by (juxt (comp str first) second))
+        set)
+   (->> new-live
+        (mapcat (fn [[k vs]]
+                  (for [v vs]
+                    [k (:trie-key v)])))
+        (sort-by (juxt (comp str first) second))
+        set))))
+
+; Files deleted from garbage and tries removed from garbage are equal
+(=
+ ; Files that were deleted but are not in the trie-diff
+ (set/difference
+  (->> (:trie-keys deleted-files)
+       (sort-by (juxt (comp str first) second))
+       set)
+  (->> removed-from-live-tries
+       (mapcat (fn [[k vs]]
+                 (for [v vs]
+                   [k (:trie-key v)])))
+       (sort-by (juxt (comp str first) second))
+       set))
+
+ ; Tries that were removed from garbage that didn't end up in new-live
+ (set/difference
+  (->> not-garbage
+       (mapcat (fn [[k vs]]
+                 (for [v vs]
+                   [k (:trie-key v)])))
+       (sort-by (juxt (comp str first) second))
+       set)
+  (->> new-live
+       (mapcat (fn [[k vs]]
+                 (for [v vs]
+                   [k (:trie-key v)])))
+       (sort-by (juxt (comp str first) second))
+       set)))
+; => true
+
+(->> new-live
+     (mapcat (fn [[_ tries]] (map :trie-key tries)))
+     (map trie/parse-trie-key)
+     (remove #(and (= (:level %) 2) (:recency %)))
+     (empty?))
+; => true
+
+; There should be a multipe of 4 of these files per table
+(reduce #(and %1 %2)
+        (for [[table tries] new-live]
+          (zero? (mod (count tries) 4))))
 ; => true
 
 ; All new live files are "full"
@@ -315,23 +374,108 @@
 (empty? deleted-garbage)
 ; => true
 
-; TODO:
-;; Goal
-(let [list-of-l2s (->> new-live)
-      (sort-by :block-idx :list)]
-  (->> (for [deleted deleted-tries]
-         (set (get-prev-n delete)))
-       (apply set/intersection)
-       (empty?)))
+#_(->> deleted-tries
+       (mapcat (fn [[k vs]] (map #(do [k %]) vs)))
+       (group-by first)
+       (map (fn [[k vs]]
+              (let [tries-br (->> vs
+                                  (map (comp :trie-key second))
+                                  sort
+                                  (map trie/parse-trie-key)
+                                  (sort-by :block-idx)
+                                  (group-by :recency))
+                    l2-eq-tries (update-vals tries-br
+                                             (fn [tfr]
+                                               (for [trie tfr
+                                                     _n (range (*  (- (:level trie) 2) 4))]
+                                                 (assoc trie :level 2))))]
+                [k tries-br #_l2-eq-tries]))))
 
-(let [table->recency->new-trie
-      (->> new-live
-           (mapcat (fn [[k vs]] (map #(do [k %]) vs)))
-           (group-by first)
-           (map (fn [[k vs]] [k (->> vs
-                                     (map (comp :trie-key second))
-                                     sort
-                                     (map trie/parse-trie-key)
-                                     (group-by :recency))])))]
-  (->> deleted-tries)
-  (for [[table recency]]))
+(comment
+  (let [trie-fx (fn [tries]
+                  (->> tries
+                       (mapcat (fn [[k vs]] (map #(do [k %]) vs)))
+                       (group-by first)
+                       (map (fn [[k vs]] [k (->> vs
+                                                 (map (comp :trie-key second))
+                                                 sort
+                                                 (map trie/parse-trie-key)
+                                                 (sort-by :block-idx)
+                                                 (group-by :recency))]))
+                       (into {})))
+        table->recency->new-tries (trie-fx new-live)
+
+        table->recency->deleted-tries (trie-fx removed-from-live-tries)]
+
+    #_(pp/pprint table->recency->new-tries)
+    (pp/pprint
+     (for [[table recencies] table->recency->deleted-tries
+           [recency del-tries] recencies
+           :let [new-tries (get-in table->recency->new-tries [table recency])
+                 ln-block-idxs (set (map :block-idx del-tries))
+                 l2-block-idxs (->> new-tries
+                                    (partition 4)
+                                    (map last)
+                                    (map :block-idx)
+                                    set)
+                 x (set/superset? l2-block-idxs ln-block-idxs)]
+           :when (not x)]
+
+       [table recency
+        new-tries
+        del-tries
+        (count new-tries)
+        (count del-tries)
+        (set/superset? l2-block-idxs ln-block-idxs)]))
+    #_(pp/pprint
+       (for [[table recencies] table->recency->deleted-tries
+             [recency del-tries] recencies]
+         (let [new-tries (get-in table->recency->new-tries [table recency])]
+
+           [table recency (count new-tries) (count del-tries)])))))
+
+; Take every 4th l2 from new-tries
+; Take the set of block indexes from del-tries
+; Is the set of l2 block indexes a superset of the del-tries block indexes?
+
+; [#xt/table system #xt/date "2025-10-20" 4 4]
+; ✅
+; [#xt/table system #xt/date "2025-11-10" 4 4]
+; ✅
+; [#xt/table system #xt/date "2025-11-17" 12 4]
+; Here, there are 3 differe block indexes for l3s
+; This aligns with there being 12 l2hs
+; All l3 block indexes appear in the l2hs in order, 4 appart
+; ✅
+; [#xt/table system #xt/date "2025-11-24" 56 25]
+; ? to come back to, has l4s
+;
+; [#xt/table system_operational_mode_status #xt/date "2025-10-20" 16 4]
+; 4 l3s, only 3 block indexes!
+; Missing b33335
+; ✅
+; [#xt/table system_operational_mode_status #xt/date "2025-10-27" 12 4]
+; 4 l3s, only 2 block indexes!
+; [#xt/table system_operational_mode_status #xt/date "2025-11-03" 24 4]
+; 4 l3s, 4 block indexes
+; L3s Missing: b33b9a, b344ef
+; ✅
+
+; - The tries removed and the deleted files match
+; - The tries that were removed "match" the tries that are now live:
+;   - All the new live tries:
+;     - Are full l2hs
+;     - There are a multiple of 4 per table/recency
+;   - All block indexes from tries removed appear as the 4th new live l2h trie
+;     - This implies that ever compaction job that produces the deleted tries is "covered" by a newly live l2h trie
+;     - The removed tries is a subset of the new live l2hs
+; - It's possible with the above check that there are some missing l2hs
+;   - The above checks reply on the fact the GC has not run in this period
+; - The tries that are now live have an assocated file in the object store
+;
+(->> new-live
+     (mapcat (fn [[k vs]] (->> vs (map (fn [{:keys [trie-key]}] {:table k :trie-key trie-key})))))
+     (mapcat (fn [{:keys [table trie-key]}] [(Trie/metaFilePath table trie-key) (Trie/dataFilePath table trie-key)]))
+     (map str)
+     (str/join "\n")
+     (spit "files.txt"))
