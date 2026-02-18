@@ -6,16 +6,20 @@ import kotlinx.serialization.json.*
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.common.serialization.StringDeserializer
+import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
 import org.testcontainers.containers.GenericContainer
 import org.testcontainers.containers.Network
 import org.testcontainers.postgresql.PostgreSQLContainer
 import org.testcontainers.containers.wait.strategy.Wait
 import org.testcontainers.kafka.ConfluentKafkaContainer
 import org.testcontainers.lifecycle.Startables
+import xtdb.api.Xtdb
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -67,11 +71,11 @@ class DebeziumIntegrationTest {
         }
     }
 
-    private fun isConnectorRunning(): Boolean {
+    private fun isConnectorRunning(connectorName: String): Boolean {
         try {
             val resp = httpClient.send(
                 HttpRequest.newBuilder()
-                    .uri(URI.create("${connectUrl()}/connectors/test-connector/status"))
+                    .uri(URI.create("${connectUrl()}/connectors/$connectorName/status"))
                     .GET()
                     .build(),
                 HttpResponse.BodyHandlers.ofString()
@@ -86,9 +90,9 @@ class DebeziumIntegrationTest {
         }
     }
 
-    private fun registerConnector() {
+    private fun registerConnector(connectorName: String, topicPrefix: String, tableIncludeList: String? = null) {
         val connectorConfig = buildJsonObject {
-            put("name", "test-connector")
+            put("name", connectorName)
             putJsonObject("config") {
                 put("connector.class", "io.debezium.connector.postgresql.PostgresConnector")
                 put("tasks.max", "1")
@@ -97,9 +101,13 @@ class DebeziumIntegrationTest {
                 put("database.user", "testuser")
                 put("database.password", "testpass")
                 put("database.dbname", "testdb")
-                put("topic.prefix", "testdb")
+                put("topic.prefix", topicPrefix)
                 put("schema.include.list", "public")
                 put("plugin.name", "pgoutput")
+                put("slot.name", "${connectorName.replace("-", "_")}_slot")
+                if (tableIncludeList != null) {
+                    put("table.include.list", tableIncludeList)
+                }
             }
         }
 
@@ -113,9 +121,13 @@ class DebeziumIntegrationTest {
         assertTrue(response.statusCode() in 200..201, "Failed to register connector: ${response.body()}")
     }
 
-    private suspend fun registerConnectorAndAwait() {
-        registerConnector()
-        while (!isConnectorRunning()) delay(500)
+    private suspend fun registerConnectorAndAwait(
+        connectorName: String,
+        topicPrefix: String,
+        tableIncludeList: String? = null,
+    ) {
+        registerConnector(connectorName, topicPrefix, tableIncludeList)
+        while (!isConnectorRunning(connectorName)) delay(500)
     }
 
     private fun executeSql(vararg statements: String) {
@@ -129,7 +141,7 @@ class DebeziumIntegrationTest {
     private suspend fun pollMessages(topic: String, expected: Int): List<JsonObject> {
         val props = mapOf(
             ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG to kafka.bootstrapServers,
-            ConsumerConfig.GROUP_ID_CONFIG to "test-consumer",
+            ConsumerConfig.GROUP_ID_CONFIG to "test-consumer-${System.nanoTime()}",
             ConsumerConfig.AUTO_OFFSET_RESET_CONFIG to "earliest",
             ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG to StringDeserializer::class.java.name,
             ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG to StringDeserializer::class.java.name,
@@ -143,7 +155,6 @@ class DebeziumIntegrationTest {
             while (messages.size < expected) {
                 val records = consumer.poll(Duration.ofSeconds(1))
                 for (record in records) {
-                    // Debezium sends tombstone records (null value) after deletes for log compaction
                     val value = record.value() ?: continue
                     messages.add(Json.parseToJsonElement(value).jsonObject)
                 }
@@ -166,15 +177,13 @@ class DebeziumIntegrationTest {
 
     @Test
     fun `debezium captures full CDC lifecycle`() = runTest(timeout = 120.seconds) {
-        // Initial (s)napshot
         executeSql(
             "CREATE TABLE IF NOT EXISTS test_items (id INT PRIMARY KEY, name TEXT)",
             "INSERT INTO test_items (id, name) VALUES (1, 'snapshot-row')",
         )
 
-        registerConnectorAndAwait()
+        registerConnectorAndAwait("test-connector", "testdb")
 
-        // (c)reate, (u)pdate, (d)elete events
         executeSql(
             "INSERT INTO test_items (id, name) VALUES (2, 'inserted')",
             "UPDATE test_items SET name = 'updated' WHERE id = 2",
@@ -187,5 +196,83 @@ class DebeziumIntegrationTest {
         assertCdcEvent(messages[1], "c", after = buildJsonObject { put("id", 2); put("name", "inserted") })
         assertCdcEvent(messages[2], "u", after = buildJsonObject { put("id", 2); put("name", "updated") })
         assertCdcEvent(messages[3], "d")
+    }
+
+    @Test
+    @Timeout(120, unit = TimeUnit.SECONDS)
+    fun `CDC events are ingested into XTDB`() {
+        // Postgres table uses _id so Debezium sends it as-is
+        executeSql(
+            "CREATE TABLE IF NOT EXISTS cdc_users (_id INT PRIMARY KEY, name TEXT, email TEXT)",
+            "INSERT INTO cdc_users (_id, name, email) VALUES (1, 'Alice', 'alice@example.com')",
+        )
+
+        runBlocking { registerConnectorAndAwait("xtdb-connector", "xtdb", tableIncludeList = "public.cdc_users") }
+
+        // Wait for snapshot to land on the topic
+        Thread.sleep(2000)
+
+        Xtdb.openNode { server { port = 0 }; flightSql = null }.use { node ->
+            val consumer = DebeziumConsumer(
+                node = node,
+                dbName = "xtdb",
+                allocator = node.allocator,
+                bootstrapServers = kafka.bootstrapServers,
+                topic = "xtdb.public.cdc_users",
+                groupId = "xtdb-cdc-test",
+            )
+
+            // Run consumer in a background thread
+            val consumerThread = Thread { consumer.start() }.also { it.start() }
+
+            try {
+                // More DML after connector is running
+                executeSql(
+                    "INSERT INTO cdc_users (_id, name, email) VALUES (2, 'Bob', 'bob@example.com')",
+                    "UPDATE cdc_users SET email = 'alice-new@example.com' WHERE _id = 1",
+                    "DELETE FROM cdc_users WHERE _id = 2",
+                )
+
+                // Poll until XTDB has the data — snapshot + 3 DML events
+                val deadline = System.currentTimeMillis() + 30_000
+                var aliceFound = false
+                while (System.currentTimeMillis() < deadline && !aliceFound) {
+                    Thread.sleep(500)
+                    try {
+                        node.getConnection().use { conn ->
+                            conn.createStatement().use { stmt ->
+                                stmt.executeQuery("SELECT _id, name, email FROM public.cdc_users ORDER BY _id").use { rs ->
+                                    while (rs.next()) {
+                                        val id = rs.getObject("_id")
+                                        val name = rs.getObject("name")
+                                        val email = rs.getObject("email")
+                                        if (id is Number && id.toLong() == 1L && name == "Alice" && email == "alice-new@example.com") {
+                                            aliceFound = true
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // Table may not exist yet
+                    }
+                }
+
+                assertTrue(aliceFound, "Expected Alice with updated email in XTDB")
+
+                // Bob should be deleted
+                node.getConnection().use { conn ->
+                    conn.createStatement().use { stmt ->
+                        stmt.executeQuery("SELECT count(*) FROM public.cdc_users WHERE _id = 2").use { rs ->
+                            rs.next()
+                            assertEquals(0L, rs.getLong(1), "Bob should be deleted")
+                        }
+                    }
+                }
+            } finally {
+                consumer.stop()
+                consumerThread.join(5000)
+            }
+        }
     }
 }
