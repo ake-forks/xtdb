@@ -11,6 +11,11 @@ on:
         description: 'Number of simulation test iterations to run'
         required: true
         type: string
+      extra_gradle_flags:
+        description: 'Extra flags appended to ./gradlew property-test'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   property-test:
@@ -32,7 +37,7 @@ jobs:
         uses: gradle/actions/setup-gradle@f29f5a9d7b09a7c6b29859002d29d24e1674c884 # v5.0.1
 
       - name: Property Test
-        run: ./gradlew property-test -Piterations=${{ inputs.iteration_count }} -PsimulationIterations=${{ inputs.simulation_iteration_count }}
+        run: ./gradlew property-test -Piterations=${{ inputs.iteration_count }} -PsimulationIterations=${{ inputs.simulation_iteration_count }} ${{ inputs.extra_gradle_flags }}
 
       - name: Publish Property Test Report
         uses: mikepenz/action-junit-report@74626db7353a25a20a72816467ebf035f674c5f8 # v6.2.0
