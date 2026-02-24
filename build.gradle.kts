@@ -93,9 +93,9 @@ val buildCustomJre = jlinkBuild.task(":buildCustomJre")
 val customJreDir = jlinkBuild.projectDir.resolve("build/custom-jre")
 val useCustomJre = !rootProj.hasProperty("fullJdk")
 
-// Pass e.g. -PcustomClojure=1.12.0-xtdb-fork to substitute org.clojure:clojure with the fork.
-// For local dev: run `mvn install` in the fork repo first (uses mavenLocal).
-// For CI: set CLOJURE_FORK_MAVEN_URL to the GitHub Packages URL of the fork repo.
+// Pass full JitPack coordinates to substitute org.clojure:clojure with a fork,
+// e.g. -PcustomClojure=com.github.YOUR_ORG:clojure:v1.12.0
+// JitPack builds directly from a public GitHub tag or commit hash - no auth or publishing step needed.
 val customClojureVersion = rootProj.findProperty("customClojure") as String?
 
 fun Project.customJreLauncher(): Provider<JavaLauncher> {
@@ -120,18 +120,7 @@ allprojects {
 
     repositories {
         if (customClojureVersion != null) {
-            // Local install takes priority - run `mvn install` in the fork repo for local dev.
-            mavenLocal()
-            val forkMavenUrl = System.getenv("CLOJURE_FORK_MAVEN_URL")
-            if (forkMavenUrl != null) {
-                maven {
-                    url = uri(forkMavenUrl)
-                    credentials {
-                        username = System.getenv("GITHUB_ACTOR") ?: ""
-                        password = System.getenv("GITHUB_TOKEN") ?: ""
-                    }
-                }
-            }
+            maven { url = uri("https://jitpack.io") }
         }
         mavenCentral()
         maven { url = uri("https://repo.clojars.org/") }
@@ -141,8 +130,8 @@ allprojects {
         configurations.all {
             resolutionStrategy.dependencySubstitution {
                 substitute(module("org.clojure:clojure"))
-                    .using(module("org.clojure:clojure:$customClojureVersion"))
-                    .because("custom Clojure fork testing (-PcustomClojure=<version>)")
+                    .using(module(customClojureVersion))
+                    .because("custom Clojure fork testing (-PcustomClojure=<jitpack-coordinates>)")
             }
         }
     }

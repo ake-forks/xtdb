@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       clojure_version:
-        description: 'Custom Clojure fork version (e.g. 1.12.0-xtdb-fork)'
+        description: 'JitPack coordinates of the fork (e.g. com.github.YOUR_ORG:clojure:v1.12.0)'
         required: true
         type: string
 
@@ -17,7 +17,6 @@ jobs:
     permissions:
       contents: read
       checks: write
-      packages: read
 
     steps:
       - name: Pick and set a random system-wide time zone
@@ -42,13 +41,6 @@ jobs:
       - name: Test with custom Clojure fork
         run: ./gradlew test -PcustomClojure=${{ inputs.clojure_version }}
         timeout-minutes: 15
-        env:
-          # Set this repository variable to the GitHub Packages Maven URL of the fork,
-          # e.g. https://maven.pkg.github.com/YOUR_ORG/clojure
-          CLOJURE_FORK_MAVEN_URL: ${{ vars.CLOJURE_FORK_MAVEN_URL }}
-          GITHUB_ACTOR: ${{ github.actor }}
-          # GITHUB_TOKEN grants read access to packages on the same org automatically.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish Test Report
         uses: mikepenz/action-junit-report@74626db7353a25a20a72816467ebf035f674c5f8 # v6.2.0
