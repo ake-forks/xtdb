@@ -116,9 +116,9 @@ allprojects {
     version = System.getenv("XTDB_VERSION") ?: "2.x-SNAPSHOT"
 
     repositories {
-        maven { url = uri("https://jitpack.io") }
         mavenCentral()
         maven { url = uri("https://repo.clojars.org/") }
+        maven { url = uri("https://jitpack.io") }
     }
 
     if (disableSmallMapsOptimisation) {
