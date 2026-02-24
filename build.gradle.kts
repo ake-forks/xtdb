@@ -93,10 +93,12 @@ val buildCustomJre = jlinkBuild.task(":buildCustomJre")
 val customJreDir = jlinkBuild.projectDir.resolve("build/custom-jre")
 val useCustomJre = !rootProj.hasProperty("fullJdk")
 
-// Pass full JitPack coordinates to substitute org.clojure:clojure with a fork,
-// e.g. -PcustomClojure=com.github.YOUR_ORG:clojure:v1.12.0
-// JitPack builds directly from a public GitHub tag or commit hash - no auth or publishing step needed.
-val customClojureVersion = rootProj.findProperty("customClojure") as String?
+// JitPack commit hash for juxt/no-small-maps-clojure; update when pulling in a new revision.
+val noSmallMapsClojureCommit = "REPLACE_WITH_COMMIT_HASH"
+
+// Pass -PdisableSmallMapsOptimisation to substitute org.clojure:clojure with the
+// juxt/no-small-maps-clojure fork, served via JitPack with no auth required.
+val disableSmallMapsOptimisation = rootProj.hasProperty("disableSmallMapsOptimisation")
 
 fun Project.customJreLauncher(): Provider<JavaLauncher> {
     val toolchainLauncher = extensions.getByType(JavaToolchainService::class.java)
@@ -119,19 +121,17 @@ allprojects {
     version = System.getenv("XTDB_VERSION") ?: "2.x-SNAPSHOT"
 
     repositories {
-        if (customClojureVersion != null) {
-            maven { url = uri("https://jitpack.io") }
-        }
+        maven { url = uri("https://jitpack.io") }
         mavenCentral()
         maven { url = uri("https://repo.clojars.org/") }
     }
 
-    if (!customClojureVersion.isNullOrEmpty()) {
+    if (disableSmallMapsOptimisation) {
         configurations.all {
             resolutionStrategy.dependencySubstitution {
                 substitute(module("org.clojure:clojure"))
-                    .using(module(customClojureVersion))
-                    .because("custom Clojure fork testing (-PcustomClojure=<jitpack-coordinates>)")
+                    .using(module("com.github.juxt:no-small-maps-clojure:$noSmallMapsClojureCommit"))
+                    .because("testing juxt/no-small-maps-clojure fork via JitPack (-PdisableSmallMapsOptimisation)")
             }
         }
     }
