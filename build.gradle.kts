@@ -93,6 +93,11 @@ val buildCustomJre = jlinkBuild.task(":buildCustomJre")
 val customJreDir = jlinkBuild.projectDir.resolve("build/custom-jre")
 val useCustomJre = !rootProj.hasProperty("fullJdk")
 
+// Pass e.g. -PcustomClojure=1.12.0-xtdb-fork to substitute org.clojure:clojure with the fork.
+// For local dev: run `mvn install` in the fork repo first (uses mavenLocal).
+// For CI: set CLOJURE_FORK_MAVEN_URL to the GitHub Packages URL of the fork repo.
+val customClojureVersion = rootProj.findProperty("customClojure") as String?
+
 fun Project.customJreLauncher(): Provider<JavaLauncher> {
     val toolchainLauncher = extensions.getByType(JavaToolchainService::class.java)
         .launcherFor(java.toolchain)
@@ -114,8 +119,32 @@ allprojects {
     version = System.getenv("XTDB_VERSION") ?: "2.x-SNAPSHOT"
 
     repositories {
+        if (customClojureVersion != null) {
+            // Local install takes priority - run `mvn install` in the fork repo for local dev.
+            mavenLocal()
+            val forkMavenUrl = System.getenv("CLOJURE_FORK_MAVEN_URL")
+            if (forkMavenUrl != null) {
+                maven {
+                    url = uri(forkMavenUrl)
+                    credentials {
+                        username = System.getenv("GITHUB_ACTOR") ?: ""
+                        password = System.getenv("GITHUB_TOKEN") ?: ""
+                    }
+                }
+            }
+        }
         mavenCentral()
         maven { url = uri("https://repo.clojars.org/") }
+    }
+
+    if (!customClojureVersion.isNullOrEmpty()) {
+        configurations.all {
+            resolutionStrategy.dependencySubstitution {
+                substitute(module("org.clojure:clojure"))
+                    .using(module("org.clojure:clojure:$customClojureVersion"))
+                    .because("custom Clojure fork testing (-PcustomClojure=<version>)")
+            }
+        }
     }
 
     if (plugins.hasPlugin("java-library")) {
