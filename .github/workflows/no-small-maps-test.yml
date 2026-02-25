@@ -1,7 +1,9 @@
-name: Custom Clojure Fork Tests
-run-name: Custom Clojure Fork Tests
+name: No Small Maps Tests
+run-name: No Small Maps Tests
 
 on:
+  schedule:
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
