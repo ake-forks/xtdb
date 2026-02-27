@@ -93,6 +93,8 @@ val buildCustomJre = jlinkBuild.task(":buildCustomJre")
 val customJreDir = jlinkBuild.projectDir.resolve("build/custom-jre")
 val useCustomJre = !rootProj.hasProperty("fullJdk")
 
+val disableSmallMapsOptimisation = rootProj.hasProperty("disableSmallMapsOptimisation")
+
 fun Project.customJreLauncher(): Provider<JavaLauncher> {
     val toolchainLauncher = extensions.getByType(JavaToolchainService::class.java)
         .launcherFor(java.toolchain)
@@ -116,6 +118,17 @@ allprojects {
     repositories {
         mavenCentral()
         maven { url = uri("https://repo.clojars.org/") }
+        maven { url = uri("https://jitpack.io") }
+    }
+
+    if (disableSmallMapsOptimisation) {
+        configurations.all {
+            resolutionStrategy.dependencySubstitution {
+                substitute(module("org.clojure:clojure"))
+                    .using(module("com.github.juxt:no-small-maps-clojure:REPLACE_WITH_COMMIT_HASH"))
+                    .because("testing juxt/no-small-maps-clojure fork via JitPack (-PdisableSmallMapsOptimisation)")
+            }
+        }
     }
 
     if (plugins.hasPlugin("java-library")) {

@@ -1,0 +1,25 @@
+name: No Small Maps Tests
+run-name: No Small Maps Tests
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  gradle-test-custom-clojure:
+    uses: ./.github/workflows/gradle-test.yml
+    with:
+      extra_gradle_flags: '-PdisableSmallMapsOptimisation'
+
+  integration-test-custom-clojure:
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      extra_gradle_flags: '-PdisableSmallMapsOptimisation'
+
+  property-test-custom-clojure:
+    uses: ./.github/workflows/property-test.yml
+    with:
+      iteration_count: "100"
+      simulation_iteration_count: "100"
+      extra_gradle_flags: '-PdisableSmallMapsOptimisation'
