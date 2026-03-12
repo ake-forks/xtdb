@@ -198,43 +198,48 @@ data class TxOpts(
     fun withFallbackTz(defaultTz: ZoneId?) = if (this.defaultTz != null) this else copy(defaultTz = defaultTz)
 }
 
+fun List<TxOp>.toRelation(al: BufferAllocator, opts: TxOpts): Relation {
+    val rel = Relation(al, txSchema)
+
+    val txOpsVec = rel["tx-ops"]
+    val txOpVec = txOpsVec.getListElements(UNION_TYPE, false)
+
+    val sqlWriter by lazy { SqlWriter(al, txOpVec) }
+    val putDocsWriter by lazy { PutDocsWriter(txOpVec) }
+    val patchDocsWriter by lazy { PatchDocsWriter(txOpVec) }
+    val deleteDocsWriter by lazy { DeleteDocsWriter(txOpVec) }
+    val eraseDocsWriter by lazy { EraseDocsWriter(txOpVec) }
+
+    for (op in this) {
+        when (op) {
+            is TxOp.PutDocs -> putDocsWriter.writeOp(op)
+            is TxOp.PatchDocs -> patchDocsWriter.writeOp(op)
+            is TxOp.DeleteDocs -> deleteDocsWriter.writeOp(op)
+            is TxOp.EraseDocs -> eraseDocsWriter.writeOp(op)
+            is TxOp.Sql -> sqlWriter.writeOp(op)
+            is TxOp.SqlBytes -> sqlWriter.writeOp(op)
+        }
+    }
+
+    txOpsVec.endList()
+
+    val sysTimeVec = rel["system-time"]
+    opts.systemTime?.let { sysTimeVec.writeObject(it) } ?: sysTimeVec.writeNull()
+
+    val defaultTz = checkNotNull(opts.defaultTz) { "missing defaultTz" }
+    rel["default-tz"].writeObject(defaultTz.id)
+
+    val userVec = rel["user"]
+    opts.user?.let { userVec.writeObject(it) } ?: userVec.writeNull()
+
+    rel["user-metadata"].writeObject(opts.userMetadata)
+
+    rel.endRow()
+    return rel
+}
+
 @JvmName("serializeTxOps")
 fun List<TxOp>.toBytes(al: BufferAllocator, opts: TxOpts): ByteArray =
-    Relation(al, txSchema).use { rel ->
-        val txOpsVec = rel["tx-ops"]
-        val txOpVec = txOpsVec.getListElements(UNION_TYPE, false)
-
-        val sqlWriter by lazy { SqlWriter(al, txOpVec) }
-        val putDocsWriter by lazy { PutDocsWriter(txOpVec) }
-        val patchDocsWriter by lazy { PatchDocsWriter(txOpVec) }
-        val deleteDocsWriter by lazy { DeleteDocsWriter(txOpVec) }
-        val eraseDocsWriter by lazy { EraseDocsWriter(txOpVec) }
-
-        for (op in this) {
-            when (op) {
-                is TxOp.PutDocs -> putDocsWriter.writeOp(op)
-                is TxOp.PatchDocs -> patchDocsWriter.writeOp(op)
-                is TxOp.DeleteDocs -> deleteDocsWriter.writeOp(op)
-                is TxOp.EraseDocs -> eraseDocsWriter.writeOp(op)
-                is TxOp.Sql -> sqlWriter.writeOp(op)
-                is TxOp.SqlBytes -> sqlWriter.writeOp(op)
-            }
-        }
-
-        txOpsVec.endList()
-
-        val sysTimeVec = rel["system-time"]
-        opts.systemTime?.let { sysTimeVec.writeObject(it) } ?: sysTimeVec.writeNull()
-
-        val defaultTz = checkNotNull(opts.defaultTz) { "missing defaultTz" }
-        rel["default-tz"].writeObject(defaultTz.id)
-
-        val userVec = rel["user"]
-        opts.user?.let { userVec.writeObject(it) } ?: userVec.writeNull()
-
-        rel["user-metadata"].writeObject(opts.userMetadata)
-
-        rel.endRow()
-
-        rel.asArrowStream
+    toRelation(al, opts).use {
+        it.asArrowStream
     }

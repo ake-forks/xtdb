@@ -30,7 +30,11 @@ class LogProcessor(
     private val meterRegistry: MeterRegistry? = null,
 ) : Log.SubscriptionListener, AutoCloseable {
 
-    interface LeaderProcessor : Log.RecordProcessor<SourceMessage>, AutoCloseable
+    interface ResolvedTxHandler {
+        fun handleResolvedTx(resolvedTx: ReplicaMessage.ResolvedTx)
+    }
+
+    interface LeaderProcessor : Log.RecordProcessor<SourceMessage>, ResolvedTxHandler, AutoCloseable
 
     interface TransitionProcessor : Log.RecordProcessor<ReplicaMessage>, AutoCloseable
 

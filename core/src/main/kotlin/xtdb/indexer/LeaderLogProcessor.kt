@@ -131,7 +131,7 @@ class LeaderLogProcessor(
         blockFinisher.finishBlock(replicaProducer, boundaryMsgId, boundaryMsg)
     }
 
-    private fun handleResolvedTx(resolvedTx: ReplicaMessage.ResolvedTx) {
+    override fun handleResolvedTx(resolvedTx: ReplicaMessage.ResolvedTx) {
         val txId = resolvedTx.txId
 
         appendToReplica(resolvedTx)
