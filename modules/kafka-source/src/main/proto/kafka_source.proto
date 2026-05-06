@@ -1,0 +1,26 @@
+edition = "2023";
+
+package xtdb.kafkasource.proto;
+
+import "google/protobuf/any.proto";
+
+option java_multiple_files = true;
+
+message KafkaTopicSourceConfig {
+    string remote = 1;
+    string topic = 2;
+    map<string, string> consumer_config = 3;
+
+    // Carried as Any so the proto stays decoupled from specific indexer config shapes.
+    google.protobuf.Any indexer = 4;
+}
+
+message KafkaTopicSourceToken {
+    int64 offset = 1;
+}
+
+message DocsIndexerConfig {
+    // Target table — qualified ('public.orders') or unqualified ('orders'),
+    // unqualified names default to the 'public' schema.
+    string table = 1;
+}
