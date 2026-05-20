@@ -92,7 +92,12 @@ private fun KafkaConfigMap.openConsumer() =
         mapOf(
             "enable.auto.commit" to "false",
             "isolation.level" to "read_committed",
-            "auto.offset.reset" to "latest",
+            // `none` — surface OffsetOutOfRangeException to the caller rather than silently
+            // jumping the consumer past records it was supposed to read. The seek paths
+            // (`tailAll`, `onPartitionAssigned`) are responsible for placing the consumer at a
+            // valid offset; anything that resolves outside the live range is a real fault and
+            // must propagate (see #5618).
+            "auto.offset.reset" to "none",
             "partition.assignment.strategy" to "org.apache.kafka.clients.consumer.CooperativeStickyAssignor",
         ) + this,
         UnitDeserializer,
