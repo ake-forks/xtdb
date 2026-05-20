@@ -3,17 +3,27 @@ package xtdb.api.log
 import com.google.protobuf.ByteString
 import io.mockk.coEvery
 import io.mockk.mockk
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import org.apache.kafka.clients.admin.AdminClient
 import org.apache.kafka.clients.admin.NewTopic
+import org.apache.kafka.clients.admin.RecordsToDelete
+import org.apache.kafka.clients.producer.KafkaProducer
+import org.apache.kafka.clients.producer.ProducerRecord
+import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.RecordTooLargeException
+import org.apache.kafka.common.serialization.ByteArraySerializer
 import org.junit.jupiter.api.*
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.io.TempDir
 import org.testcontainers.kafka.ConfluentKafkaContainer
 import xtdb.api.Xtdb
 import xtdb.api.log.Log.*
@@ -21,9 +31,11 @@ import xtdb.api.storage.Storage
 import xtdb.database.Database
 import xtdb.log.proto.TrieDetails
 import xtdb.log.proto.trieMetadata
+import xtdb.util.MsgIdUtil
 import xtdb.util.asPath
 import xtdb.util.closeAll
 import java.nio.ByteBuffer
+import java.nio.file.Path
 import java.time.Duration
 import java.util.*
 import java.util.Collections.synchronizedList
@@ -491,6 +503,133 @@ class KafkaClusterTest {
                 job2.cancelAndJoin()
             }
         }
+
+    // Polls `check` until it returns true or the wall-clock deadline expires. Runs on
+    // `Dispatchers.IO` so the inner `delay` uses real wall-clock rather than runTest's
+    // virtual scheduler (which would skip the delay and busy-loop).
+    private suspend fun waitWithDeadline(timeout: kotlin.time.Duration, check: () -> Boolean) {
+        withContext(Dispatchers.IO) {
+            val deadline = System.currentTimeMillis() + timeout.inWholeMilliseconds
+            while (System.currentTimeMillis() < deadline && !check()) delay(50)
+        }
+    }
+
+    // #5618 Case 2 — anchored resume against a topic truncated past the anchor (data loss).
+    // Storage is XTDB's durability contract; the log is a bounded buffer sized by the operator.
+    // When retention has eaten records the indexer needs to be consistent, tailAll must surface
+    // a descriptive failure rather than silently dying or — as currently happens — silently
+    // auto-resetting and parking in a state where records are neither delivered nor lost loudly.
+    //
+    // The two assertions catch two distinct pre-fix pathologies:
+    //   1. `received != 0` — any records leaked to the subscriber while truncation eats committed
+    //      history. Pre-fix this passes vacuously (consumer is stuck delivering nothing); guards
+    //      against a future regression that would turn the bug into a silent skip + continue.
+    //   2. `caught == null` — the job never threw. Pre-fix this fires: consumer is alive and
+    //      polling silently, no operator-visible signal that records were lost.
+    @Test
+    fun `tailAll fails when its anchor offset has been truncated (#5618)`() = runTest(timeout = 30.seconds) {
+        val topicName = "trunc-anchored-${UUID.randomUUID()}"
+        val msgs = synchronizedList(mutableListOf<List<Record<SourceMessage>>>())
+        val subscriber = mockk<RecordProcessor<SourceMessage>> {
+            coEvery { processRecords(capture(msgs)) } returns Unit
+        }
+
+        val caught: Throwable? = KafkaCluster.ClusterFactory(container.bootstrapServers)
+            .pollDuration(Duration.ofMillis(100))
+            .open().use { cluster ->
+                KafkaCluster.LogFactory("my-cluster", topicName)
+                    .openSourceLog(mapOf("my-cluster" to cluster))
+                    .use { log ->
+                        // Append five records (offsets 0–4) then truncate past offset 1.
+                        // Live range: offsets 3–4; truncated prefix: offsets 0–2.
+                        repeat(5) { i -> log.appendMessage(txMessage((i + 1).toByte())) }
+                        AdminClient.create(mapOf<String, Any>("bootstrap.servers" to container.bootstrapServers)).use { admin ->
+                            admin.deleteRecords(
+                                mapOf(TopicPartition(topicName, 0) to RecordsToDelete.beforeOffset(3L))
+                            ).all().get()
+                        }
+
+                        // Anchor at (epoch=0, offset=0) — afterMsgIdToOffset → 0, seek target = 1,
+                        // lwm = 3 → first poll hits OOR.
+                        val anchor = MsgIdUtil.offsetToMsgId(0, 0L)
+                        val job = async { log.tailAll(anchor, subscriber) }
+
+                        // Post-fix exits as soon as the job completes; pre-fix waits real wall-clock.
+                        waitWithDeadline(3.seconds) { job.isCompleted }
+
+                        // Append fresh records past the original truncated range. If the consumer
+                        // has silently auto-reset, these arrive and prove silent skip of offsets 1–2.
+                        log.appendMessage(txMessage(6))
+                        log.appendMessage(txMessage(7))
+                        waitWithDeadline(3.seconds) {
+                            job.isCompleted || synchronized(msgs) { msgs.flatten().isNotEmpty() }
+                        }
+
+                        val ex = if (job.isCompleted) job.getCompletionExceptionOrNull() else null
+                        job.cancelAndJoin()
+                        ex
+                    }
+            }
+
+        assertEquals(0, synchronized(msgs) { msgs.flatten().size },
+            "received records past a truncated anchor — silent skip is data loss")
+        assertNotNull(caught, "tailAll must throw when its anchor has been truncated, not silently auto-reset")
+    }
+
+    // #5618 Case 2, node-level. Companion to the cluster-level test above, exercising the same
+    // failure mode through the public node API: a node restarts against a source log whose
+    // earliest offset has advanced past the anchor recorded in storage. The follower has no
+    // way to converge with the leader's committed history — the records between the anchor and
+    // the topic's low-watermark are simply gone. The right answer is a loud failure so the
+    // operator notices, rather than the node coming up and silently lagging forever.
+    @Test
+    @Timeout(value = 60, unit = java.util.concurrent.TimeUnit.SECONDS)
+    fun `node fails to resume when source log anchor has been truncated (#5618)`(
+        @TempDir storageDir: Path,
+    ) {
+        val topicName = "trunc-node-case2-${UUID.randomUUID()}"
+
+        // First boot: drive a tx with rowsPerBlock=1 so a block (and its anchor) lands in storage.
+        Xtdb.openNode {
+            server { port = 0 }; flightSql = null
+            indexer { rowsPerBlock = 1L }
+            logCluster("kafka", KafkaCluster.ClusterFactory(container.bootstrapServers))
+            log(KafkaCluster.LogFactory("kafka", topicName))
+            storage(Storage.local(storageDir))
+        }.use { node ->
+            node.connection.use { conn ->
+                conn.createStatement().use { stmt ->
+                    stmt.execute("INSERT INTO foo (_id, x) VALUES (1, 1)")
+                }
+            }
+        }
+
+        // Extend the topic with filler bytes and truncate the live range past the persisted anchor.
+        val kafkaProps = mapOf<String, Any>("bootstrap.servers" to container.bootstrapServers, "acks" to "all")
+        KafkaProducer(kafkaProps, ByteArraySerializer(), ByteArraySerializer()).use { p ->
+            repeat(5) { p.send(ProducerRecord(topicName, ByteArray(8))) }
+            p.flush()
+        }
+        AdminClient.create(mapOf<String, Any>("bootstrap.servers" to container.bootstrapServers)).use { admin ->
+            admin.deleteRecords(
+                mapOf(TopicPartition(topicName, 0) to RecordsToDelete.beforeOffset(3L))
+            ).all().get()
+        }
+
+        // Reopen — the resume seek lands in the truncated prefix and must throw rather than
+        // silently auto-reset. The polling job propagates the OffsetOutOfRangeException out of
+        // its scope, taking openNode with it.
+        val caught = assertThrows<Throwable> {
+            Xtdb.openNode {
+                server { port = 0 }; flightSql = null
+                indexer { rowsPerBlock = 1L }
+                logCluster("kafka", KafkaCluster.ClusterFactory(container.bootstrapServers))
+                log(KafkaCluster.LogFactory("kafka", topicName))
+                storage(Storage.local(storageDir))
+            }.use { /* expected to throw on open or first use */ }
+        }
+        assertNotNull(caught)
+    }
 
     @Test
     @Timeout(value = 30, unit = java.util.concurrent.TimeUnit.SECONDS)
