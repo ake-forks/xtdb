@@ -104,6 +104,21 @@ private fun KafkaConfigMap.openConsumer() =
         ByteArrayDeserializer()
     )
 
+// `afterMsgIdToOffset` returns -1 when there's no recovery anchor (fresh boot, or a stale
+// msg-id from a previous epoch), and the caller would naively seek to absolute offset 0.
+// On a topic whose low-watermark has moved past 0 under retention that's out-of-range, so
+// we resolve `-1` to the partition's current earliest offset instead. There's no committed
+// history to lose in this case (the caller has nothing indexed), so picking up the live tail
+// is the correct behaviour. Anchored seeks (`afterMsgIdToOffset >= 0`) are deliberately not
+// clamped — if those land out-of-range, that's Case 2 of #5618 and must surface as an error.
+private fun resolveStartOffset(
+    consumer: KafkaConsumer<*, *>, tp: TopicPartition, epoch: Int, afterMsgId: MessageId,
+): Long {
+    val resolved = afterMsgIdToOffset(epoch, afterMsgId)
+    if (resolved >= 0) return resolved + 1
+    return consumer.beginningOffsets(listOf(tp))[tp] ?: 0L
+}
+
 fun AdminClient.ensureTopicExists(topic: String, autoCreate: Boolean) {
     val desc =
         try {
@@ -171,7 +186,7 @@ class KafkaCluster(
                 listener.onPartitionsAssigned(listOf(tp.partition()))
                     ?.let { tailSpec ->
                         processor = tailSpec.processor
-                        consumer.seek(tp, afterMsgIdToOffset(epoch, tailSpec.afterMsgId) + 1)
+                        consumer.seek(tp, resolveStartOffset(consumer, tp, epoch, tailSpec.afterMsgId))
                     }
             }
 
@@ -570,7 +585,7 @@ class KafkaCluster(
             kafkaConfigMap.openConsumer().use { c ->
                 val tp = TopicPartition(topic, 0)
                 c.assign(listOf(tp))
-                c.seek(tp, afterMsgIdToOffset(epoch, afterMsgId) + 1)
+                c.seek(tp, resolveStartOffset(c, tp, epoch, afterMsgId))
 
                 while (isActive) {
                     val records = runInterruptible(Dispatchers.IO) { c.pollRecords() }
