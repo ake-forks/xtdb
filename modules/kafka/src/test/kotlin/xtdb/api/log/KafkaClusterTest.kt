@@ -37,6 +37,8 @@ import xtdb.log.proto.trieMetadata
 import xtdb.util.MsgIdUtil
 import xtdb.util.asPath
 import xtdb.util.closeAll
+import xtdb.util.info
+import xtdb.util.logger
 import java.nio.ByteBuffer
 import java.nio.file.Path
 import java.time.Duration
@@ -50,6 +52,7 @@ import kotlin.time.Duration.Companion.seconds
 @Tag("integration")
 class KafkaClusterTest {
     companion object {
+        private val LOG = KafkaClusterTest::class.logger
         private val container = ConfluentKafkaContainer("confluentinc/cp-kafka:7.8.0")
 
         @JvmStatic
@@ -424,18 +427,25 @@ class KafkaClusterTest {
         }
     }
 
-    private class RacingListener : SubscriptionListener<SourceMessage> {
+    private class RacingListener(private val tag: String) : SubscriptionListener<SourceMessage> {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
         val records = CopyOnWriteArrayList<Record<SourceMessage>>()
 
         override suspend fun onPartitionsAssigned(partitions: Collection<Int>): TailSpec<SourceMessage> {
+            LOG.info { "[seek-race:$tag] onPartitionsAssigned entered, partitions=$partitions" }
             entered.complete(Unit)
             release.await()
-            return TailSpec(-1L, RecordProcessor { recs -> records.addAll(recs) })
+            LOG.info { "[seek-race:$tag] onPartitionsAssigned released, returning TailSpec" }
+            return TailSpec(-1L, RecordProcessor { recs ->
+                LOG.info { "[seek-race:$tag] processRecords: ${recs.size} record(s)" }
+                records.addAll(recs)
+            })
         }
 
-        override suspend fun onPartitionsRevoked(partitions: Collection<Int>) {}
+        override suspend fun onPartitionsRevoked(partitions: Collection<Int>) {
+            LOG.info { "[seek-race:$tag] onPartitionsRevoked partitions=$partitions" }
+        }
     }
 
     @Test
@@ -445,30 +455,47 @@ class KafkaClusterTest {
 
         withClusterAndLogs(listOf(topic1, topic2)) { _, logs ->
             val (log1, log2) = logs
-            val listener1 = RacingListener()
-            val listener2 = RacingListener()
+            val listener1 = RacingListener("l1")
+            val listener2 = RacingListener("l2")
 
+            LOG.info { "[seek-race] launching job1" }
             val job1 = launch { log1.openGroupSubscription(listener1) }
+            LOG.info { "[seek-race] awaiting listener1.entered" }
             listener1.entered.await()
+            LOG.info { "[seek-race] listener1.entered done" }
 
             // second register() arms consumer.wakeup() while topic1's callback is parked.
+            LOG.info { "[seek-race] launching job2" }
             val job2 = launch { log2.openGroupSubscription(listener2) }
             yield()
+            LOG.info { "[seek-race] post-yield, releasing listener1" }
 
             listener1.release.complete(Unit)
+            LOG.info { "[seek-race] listener1 released, awaiting listener2.entered" }
 
             listener2.entered.await()
+            LOG.info { "[seek-race] listener2.entered done, releasing listener2" }
             listener2.release.complete(Unit)
+            LOG.info { "[seek-race] listener2 released, appending messages" }
 
             log1.appendMessage(txMessage(1))
             log2.appendMessage(txMessage(2))
+            LOG.info { "[seek-race] messages appended, waiting for records to flow" }
 
             // an inner withTimeout would use the TestScope's virtual clock and trip before
             // records flow; rely on the outer real-time runTest timeout instead.
-            while (listener1.records.isEmpty() || listener2.records.isEmpty()) delay(50.milliseconds)
+            var iter = 0
+            while (listener1.records.isEmpty() || listener2.records.isEmpty()) {
+                delay(50.milliseconds)
+                if (++iter % 20 == 0) {
+                    LOG.info { "[seek-race] still waiting (iter=$iter, l1=${listener1.records.size}, l2=${listener2.records.size})" }
+                }
+            }
+            LOG.info { "[seek-race] records flowed, cancelling jobs" }
 
             job1.cancelAndJoin()
             job2.cancelAndJoin()
+            LOG.info { "[seek-race] test body done" }
         }
     }
 
