@@ -297,16 +297,21 @@ class KafkaCluster(
             }
         }
 
+        private var pollSeq: Long = 0L
+
         private suspend fun KafkaConsumer<*, ByteArray>.pollRecords() =
             runInterruptible(Dispatchers.IO) {
+                val seq = ++pollSeq
+                val tEnter = System.nanoTime()
+                LOG.info { "[poll-trace] poll #$seq enter (subs=${subscriptions.keys}, assignment=${assignment()})" }
                 try {
                     val records = poll(pollDuration)
-                    if (!records.isEmpty) {
-                        LOG.info { "[poll-trace] poll returned ${records.count()} record(s) across topics ${records.partitions().map { it.topic() }.toSet()}" }
-                    }
+                    val durMs = (System.nanoTime() - tEnter) / 1_000_000
+                    LOG.info { "[poll-trace] poll #$seq exit ${records.count()} record(s) in ${durMs}ms (assignment=${assignment()})" }
                     records
                 } catch (_: WakeupException) {
-                    LOG.info { "[poll-trace] poll caught WakeupException (current subs=${subscriptions.keys}, assignment=${assignment()})" }
+                    val durMs = (System.nanoTime() - tEnter) / 1_000_000
+                    LOG.info { "[poll-trace] poll #$seq caught WakeupException in ${durMs}ms (subs=${subscriptions.keys}, assignment=${assignment()})" }
                     ConsumerRecords.empty()
                 } catch (e: InterruptException) {
                     throw InterruptedException().initCause(e)
