@@ -205,40 +205,49 @@ class KafkaCluster(
 
             LOG.info { "[poll-trace] applySubscriptions: topics=$topics" }
             if (topics.isEmpty()) consumer.unsubscribe()
-            else consumer.subscribe(topics, object : ConsumerRebalanceListener {
-                override fun onPartitionsAssigned(partitions: Collection<TopicPartition>) =
-                    launderInterruptedException {
-                        LOG.info { "[poll-trace] rebalance.onPartitionsAssigned enter partitions=$partitions" }
-                        runBlocking {
-                            for ((topic, tps) in partitions.groupBy { it.topic() }) {
-                                val sub = subscriptions[topic] as? TopicSubscription<Any?> ?: continue
-                                try {
-                                    sub.onPartitionAssigned(tps.single())
-                                } catch (e: Throwable) {
-                                    LOG.error(e) { "onPartitionsAssigned($partitions): failed handling assignment for topic '$topic' ($tps)" }
-                                    throw e
+            else {
+                consumer.subscribe(topics, object : ConsumerRebalanceListener {
+                    override fun onPartitionsAssigned(partitions: Collection<TopicPartition>) =
+                        launderInterruptedException {
+                            LOG.info { "[poll-trace] rebalance.onPartitionsAssigned enter partitions=$partitions" }
+                            runBlocking {
+                                for ((topic, tps) in partitions.groupBy { it.topic() }) {
+                                    val sub = subscriptions[topic] as? TopicSubscription<Any?> ?: continue
+                                    try {
+                                        sub.onPartitionAssigned(tps.single())
+                                    } catch (e: Throwable) {
+                                        LOG.error(e) { "onPartitionsAssigned($partitions): failed handling assignment for topic '$topic' ($tps)" }
+                                        throw e
+                                    }
                                 }
                             }
+                            LOG.info { "[poll-trace] rebalance.onPartitionsAssigned exit partitions=$partitions" }
                         }
-                        LOG.info { "[poll-trace] rebalance.onPartitionsAssigned exit partitions=$partitions" }
-                    }
 
-                override fun onPartitionsRevoked(partitions: Collection<TopicPartition>) =
-                    launderInterruptedException {
-                        LOG.info { "[poll-trace] rebalance.onPartitionsRevoked enter partitions=$partitions" }
-                        runBlocking {
-                            for ((topic, tps) in partitions.groupBy { it.topic() }) {
-                                try {
-                                    subscriptions[topic]?.onPartitionRevoked(tps.single())
-                                } catch (e: Throwable) {
-                                    LOG.error(e) { "onPartitionsRevoked($partitions): failed handling revocation for topic '$topic' ($tps)" }
-                                    throw e
+                    override fun onPartitionsRevoked(partitions: Collection<TopicPartition>) =
+                        launderInterruptedException {
+                            LOG.info { "[poll-trace] rebalance.onPartitionsRevoked enter partitions=$partitions" }
+                            runBlocking {
+                                for ((topic, tps) in partitions.groupBy { it.topic() }) {
+                                    try {
+                                        subscriptions[topic]?.onPartitionRevoked(tps.single())
+                                    } catch (e: Throwable) {
+                                        LOG.error(e) { "onPartitionsRevoked($partitions): failed handling revocation for topic '$topic' ($tps)" }
+                                        throw e
+                                    }
                                 }
                             }
+                            LOG.info { "[poll-trace] rebalance.onPartitionsRevoked exit partitions=$partitions" }
                         }
-                        LOG.info { "[poll-trace] rebalance.onPartitionsRevoked exit partitions=$partitions" }
-                    }
-            })
+                })
+
+                // Force a rejoin on the next poll. Necessary because a `wakeup()` call from
+                // another `register()`/`unregister()` racing with the previous rebalance's
+                // post-callback finalization can leave the consumer's `needs-rejoin` flag
+                // unset — subsequent `subscribe()` calls then silently no-op and the new
+                // topic's partitions never get assigned (see #5633).
+                consumer.enforceRebalance("xtdb subscription set changed")
+            }
         }
 
         private fun processCommand(cmd: GroupCommand) {
