@@ -203,10 +203,12 @@ class KafkaCluster(
         private fun applySubscriptions() {
             val topics = subscriptions.keys.toList()
 
+            LOG.info { "[poll-trace] applySubscriptions: topics=$topics" }
             if (topics.isEmpty()) consumer.unsubscribe()
             else consumer.subscribe(topics, object : ConsumerRebalanceListener {
                 override fun onPartitionsAssigned(partitions: Collection<TopicPartition>) =
                     launderInterruptedException {
+                        LOG.info { "[poll-trace] rebalance.onPartitionsAssigned enter partitions=$partitions" }
                         runBlocking {
                             for ((topic, tps) in partitions.groupBy { it.topic() }) {
                                 val sub = subscriptions[topic] as? TopicSubscription<Any?> ?: continue
@@ -218,10 +220,12 @@ class KafkaCluster(
                                 }
                             }
                         }
+                        LOG.info { "[poll-trace] rebalance.onPartitionsAssigned exit partitions=$partitions" }
                     }
 
                 override fun onPartitionsRevoked(partitions: Collection<TopicPartition>) =
                     launderInterruptedException {
+                        LOG.info { "[poll-trace] rebalance.onPartitionsRevoked enter partitions=$partitions" }
                         runBlocking {
                             for ((topic, tps) in partitions.groupBy { it.topic() }) {
                                 try {
@@ -232,11 +236,17 @@ class KafkaCluster(
                                 }
                             }
                         }
+                        LOG.info { "[poll-trace] rebalance.onPartitionsRevoked exit partitions=$partitions" }
                     }
             })
         }
 
         private fun processCommand(cmd: GroupCommand) {
+            val tag = when (cmd) {
+                is GroupCommand.Register -> "Register(${cmd.topic})"
+                is GroupCommand.Unregister -> "Unregister(${cmd.topic})"
+            }
+            LOG.info { "[poll-trace] processCommand: $tag (current subs=${subscriptions.keys})" }
             when (cmd) {
                 is GroupCommand.Register -> {
                     check(cmd.topic !in subscriptions) { "Topic ${cmd.topic} already registered" }
@@ -290,8 +300,13 @@ class KafkaCluster(
         private suspend fun KafkaConsumer<*, ByteArray>.pollRecords() =
             runInterruptible(Dispatchers.IO) {
                 try {
-                    poll(pollDuration)
+                    val records = poll(pollDuration)
+                    if (!records.isEmpty) {
+                        LOG.info { "[poll-trace] poll returned ${records.count()} record(s) across topics ${records.partitions().map { it.topic() }.toSet()}" }
+                    }
+                    records
                 } catch (_: WakeupException) {
+                    LOG.info { "[poll-trace] poll caught WakeupException (current subs=${subscriptions.keys}, assignment=${assignment()})" }
                     ConsumerRecords.empty()
                 } catch (e: InterruptException) {
                     throw InterruptedException().initCause(e)
