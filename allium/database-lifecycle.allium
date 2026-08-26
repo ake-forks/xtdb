@@ -8,7 +8,7 @@
 -- Transaction processing, block flushing and query execution are db.allium's; leader election is log-processor-lifecycle.allium's.
 -- Here a running database is opaque: it either resolves by name or it does not.
 --
--- Three words recur, and they nest.
+-- The words below recur, and they nest.
 --
 -- - HOLD -- a record for this name exists on this node.
 --   What `holds` tests.
@@ -22,18 +22,17 @@
 -- - RUN -- the database is working: indexing, and resolvable by name.
 --
 -- A running database is a member, and a member is held; neither converse holds.
--- Each of the three states below drops exactly one of the three words.
 --
 -- The MEMBER axis only exists where a node writes the record back, and `membership_source` says which kind of node this is.
 -- A durable_record node reads its set at startup and hands it to the recorder thereafter.
 -- A fixed node is given its whole set by the operator and never writes one.
 -- HOLD and RUN apply to both.
--- The membership instructions and the membership surface exist only on the first, and a fixed node reaches only `open`.
+-- The membership instructions and the membership surface exist only on a durable_record node, and a fixed node reaches only `open`.
 --
 -- Attach and detach are cluster-wide instructions -- every node receives them and applies them to its own set independently.
 -- This spec describes what ONE node does with them; how an instruction reaches the node belongs to db.allium.
 --
--- Three states a held name can be in, of which only the first is reachable on a fixed node.
+-- The states a held name can be in, of which only `open` is reachable on a fixed node.
 --
 -- - open -- held, a member, running.
 --
@@ -51,7 +50,6 @@
 --
 -- - It is in no set the node hands over, which tells the recorder no such database exists.
 --
--- Each of the two states that do not run keeps one of the other two words.
 -- Skipped stays a member because a node that declined to run a database and dropped it from its set would delete it.
 -- Detaching stays held because a database's resources have to be fully released before anything may take its place.
 -- Its record keeps the name occupied for as long as that takes, while the removal itself has already taken effect.
@@ -340,8 +338,8 @@ surface DatabaseResolution {
 
     @guarantee OnlyRunningDatabasesResolve
         -- A name resolves only while the database behind it runs.
-        -- A caller sees nothing at all of a detaching or skipped one: not its name, not that it exists.
-        -- It therefore cannot tell either from a name this node never held.
+        -- A caller sees nothing at all of a held name that is not running: not the name, not that it exists.
+        -- It therefore cannot tell one from a name this node never held.
 }
 
 surface Membership {
