@@ -70,6 +70,9 @@ class DatabaseCatalog @JvmOverloads constructor(
         /** Ingestion has stopped, and a replacement is due. */
         class Recovering(override val db: Database) : Resolvable
 
+        /** Ingestion has stopped, and this node will do nothing further about it. */
+        class Stopped(override val db: Database) : Resolvable
+
         class Skipped(override val config: Database.Config) : Entry
 
         /**
@@ -125,6 +128,11 @@ class DatabaseCatalog @JvmOverloads constructor(
     override val txScoped = false
 
     override fun databaseOrNull(dbName: DatabaseName): Database? = (entries[dbName] as? Entry.Resolvable)?.db
+
+    override val abandonedDatabases: Map<DatabaseName, Database.Config>
+        get() = entries.entries
+            .filter { it.value is Entry.Stopped || it.value is Entry.Stranded }
+            .associate { (dbName, entry) -> dbName to entry.config }
 
     override val serialisedSecondaryDatabases: Map<DatabaseName, DatabaseConfig>
         get() = entries.entries
@@ -277,7 +285,11 @@ class DatabaseCatalog @JvmOverloads constructor(
             attempts = if (failure.latestTxId > lastFailedAt) 1 else attempts + 1
             lastFailedAt = failure.latestTxId
 
-            if (!restartable(dbName, failure.exception.cause, attempts)) return@launch
+            if (!restartable(dbName, failure.exception.cause, attempts)) {
+                // still answering reads, and now saying that nothing more is coming
+                entries.replace(dbName, current, Entry.Stopped(db))
+                return@launch
+            }
 
             // The wait happens with the database still behind the name, answering reads at the basis it
             // reached, so what a caller loses is the replacement's open rather than the wait for one.

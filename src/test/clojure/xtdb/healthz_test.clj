@@ -68,21 +68,60 @@
         (t/testing "alive endpoint - non errored indexer"
           (t/is (= 200 (:status (clj-http/get (->healthz-url port "alive"))))))
 
-        (t/testing "alive endpoint with indexer error"
-          (with-redefs [healthz/get-ingestion-error (fn [_] (Exception. "Indexer error"))]
-            (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
-              (t/is (= 503 (:status resp)))
-              (t/is (re-find #"Indexer error" (:body resp))))))))))
+        (t/testing "a primary that stops ingesting takes the node out of service"
+          ;; never restarted, so its supervisor's whole job is to record that nothing more is coming
+          (let [^Database$Catalog db-cat (db/<-node node)
+                deadline (+ (System/nanoTime) 20000000000)]
+            (.notifyError (.getWatchers ^Database (.databaseOrNull db-cat "xtdb")) (Exception. "Indexer error"))
+            (loop []
+              (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
+                (cond
+                  (= 503 (:status resp)) (t/is (re-find #"Indexer error" (:body resp)))
+                  (< (System/nanoTime) deadline) (do (Thread/sleep 20) (recur))
+                  :else (t/is false "the primary's failure never reached healthz"))))))))))
 
 (t/deftest test-error-response
   (util/with-tmp-dirs #{local-path}
     (with-open [node (tu/->local-node {:node-dir local-path})]
       (let [port (.getHealthzPort node)]
         (t/testing "server thrown error responds with reasonable message"
-          (with-redefs [healthz/get-ingestion-error (fn [_] (throw (Exception. "Some server error.")))]
+          (with-redefs [healthz/abandoned-problems (fn [_ _] (throw (Exception. "Some server error.")))]
             (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
               (t/is (= 500 (:status resp)))
               (t/is (re-find #"Exception when calling endpoint - java.lang.Exception: Some server error." (:body resp))))))))))
+
+(t/deftest test-abandoned-database-reported-and-503s-when-critical
+  (t/testing "criticality is read off the config the catalog hands over"
+    (let [db-cat (reify Database$Catalog
+                   (databaseOrNull [_ _] nil))]
+      (t/is (= [{:db "cdc", :critical true, :ingestion-error nil, :abandoned? true}]
+               (healthz/abandoned-problems db-cat {"cdc" (.critical (Database$Config.) true)})))
+      (t/is (= [{:db "cdc", :critical false, :ingestion-error nil, :abandoned? true}]
+               (healthz/abandoned-problems db-cat {"cdc" (Database$Config.)})))))
+
+  (with-open [node (xtn/start-node {:log [:in-memory]
+                                    :storage [:in-memory]
+                                    :healthz {}})]
+    (let [port (.getHealthzPort node)
+          alive-resp (fn []
+                       (let [{:keys [status headers body]}
+                             (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
+                         [status (get headers "X-XTDB-Databases-Unhealthy") body]))]
+
+      (t/is (= [200 "0"] (subvec (alive-resp) 0 2)) "nothing abandoned")
+
+      (t/testing "a critical one takes the node out of service"
+        (with-redefs [healthz/abandoned-problems (fn [_ _] [{:db "cdc", :critical true, :abandoned? true}])]
+          (let [[status unhealthy body] (alive-resp)]
+            (t/is (= 503 status))
+            (t/is (= "1" unhealthy))
+            (t/is (re-find #"cdc \(not being put back up" body)))))
+
+      (t/testing "a non-critical one is counted but leaves the node in service"
+        (with-redefs [healthz/abandoned-problems (fn [_ _] [{:db "cdc", :critical false, :abandoned? true}])]
+          (let [[status unhealthy] (alive-resp)]
+            (t/is (= 200 status))
+            (t/is (= "1" unhealthy))))))))
 
 (t/deftest test-block-lag-healthy-4364
   (with-open [node (xtn/start-node {:log [:in-memory]
@@ -195,25 +234,23 @@
             (t/is (= 200 (:status resp)))
             (t/is (= "3" (get-in resp [:headers "X-XTDB-Databases-Checked"])))))
 
-        (t/testing "non-critical secondary ingestion error does not affect liveness"
-          (let [orig-fn healthz/get-ingestion-error]
-            (with-redefs [healthz/get-ingestion-error (fn [^Database db]
-                                                        (if (= "non-critical-db" (.getName db))
-                                                          (Exception. "Non-critical error")
-                                                          (orig-fn db)))]
-              (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
-                (t/is (= 200 (:status resp)))
-                (t/is (= "1" (get-in resp [:headers "X-XTDB-Databases-Unhealthy"])))))))
+        (t/testing "a secondary that stopped ingesting and is being recovered stays alive"
+          (.notifyError (.getWatchers ^Database (.databaseOrNull db-cat "critical-db")) (Exception. "transient"))
+          (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
+            (t/is (= 200 (:status resp))
+                  "a database being put back up must not take the node out of service")))
 
-        (t/testing "critical secondary ingestion error triggers 503"
-          (let [orig-fn healthz/get-ingestion-error]
-            (with-redefs [healthz/get-ingestion-error (fn [^Database db]
-                                                        (if (= "critical-db" (.getName db))
-                                                          (Exception. "Critical error")
-                                                          (orig-fn db)))]
-              (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
-                (t/is (= 503 (:status resp)))
-                (t/is (re-find #"critical-db" (:body resp)))))))))))
+        (t/testing "a non-critical secondary nothing will put back up is counted, and stays alive"
+          (with-redefs [healthz/abandoned-problems (fn [_ _] [{:db "non-critical-db", :critical false, :abandoned? true}])]
+            (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
+              (t/is (= 200 (:status resp)))
+              (t/is (= "1" (get-in resp [:headers "X-XTDB-Databases-Unhealthy"]))))))
+
+        (t/testing "a critical secondary nothing will put back up triggers 503"
+          (with-redefs [healthz/abandoned-problems (fn [_ _] [{:db "critical-db", :critical true, :abandoned? true}])]
+            (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
+              (t/is (= 503 (:status resp)))
+              (t/is (re-find #"critical-db" (:body resp))))))))))
 
 (t/deftest test-listed-but-unresolvable-database-is-skipped
   (let [db-cat (reify Database$Catalog
@@ -223,11 +260,7 @@
           "a name that no longer resolves must not reach the callers that dereference it")))
 
 (t/deftest test-alive-primary-always-critical
-  (util/with-tmp-dirs #{local-path}
-    (with-open [node (tu/->local-node {:node-dir local-path})]
-      (let [port (.getHealthzPort node)]
-        (t/testing "primary database ingestion error triggers 503"
-          (with-redefs [healthz/get-ingestion-error (fn [_] (Exception. "Primary error"))]
-            (let [resp (clj-http/get (->healthz-url port "alive") {:throw-exceptions false})]
-              (t/is (= 503 (:status resp)))
-              (t/is (re-find #"xtdb.*Primary error" (:body resp))))))))))
+  (t/is (Database/isCritical "xtdb" (Database$Config.))
+        "the primary is critical whatever its config says, which is how it is attached")
+  (t/is (not (Database/isCritical "cdc" (Database$Config.))))
+  (t/is (Database/isCritical "cdc" (.critical (Database$Config.) true))))

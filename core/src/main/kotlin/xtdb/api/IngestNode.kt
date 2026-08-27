@@ -79,6 +79,10 @@ class IngestNode internal constructor(
         override fun checkCanDetach(dbName: DatabaseName): Unit =
             error("can't detach a database from an ingest node")
 
+        // nothing here puts a database back up, so one that has stopped ingesting is not coming back
+        override val abandonedDatabases: Map<DatabaseName, Database.Config>
+            get() = dbs.filterValues { it.ingestionError != null }.mapValues { it.value.config }
+
         override fun attach(dbName: DatabaseName, config: Database.Config?): Unit =
             error("can't attach a database to an ingest node")
 

@@ -85,7 +85,7 @@ internal abstract class LeaderTermTest {
         val attached = mutableListOf<DatabaseName>()
 
         override val databaseNames get() = attached.toSet()
-        override val strandedDatabases: Map<DatabaseName, Database.Config> = emptyMap()
+        override val abandonedDatabases: Map<DatabaseName, Database.Config> = emptyMap()
         override val txScoped = false
         override fun databaseOrNull(dbName: DatabaseName): Database? = null
 

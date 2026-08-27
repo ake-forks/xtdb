@@ -124,7 +124,7 @@ class Database(
     suspend fun awaitFailure(): Watchers.Failure = watchers.awaitFailure()
 
     /** Whether an ingestion error here should take the whole node out of service. */
-    val isCritical: Boolean get() = name == "xtdb" || config.critical
+    val isCritical: Boolean get() = isCritical(name, config)
 
     fun awaitTxBlocking(txId: Long, timeout: Duration? = null): TransactionResult? =
         runBlocking {
@@ -200,6 +200,15 @@ class Database(
     }
 
     companion object {
+        /**
+         * Whether an ingestion error takes the whole node out of service.
+         *
+         * Named as well as configured: the primary is critical whatever its config says, and an
+         * abandoned database may have to be judged from its config alone, with no instance to ask.
+         */
+        @JvmStatic
+        fun isCritical(dbName: DatabaseName, config: Config) = dbName == "xtdb" || config.critical
+
         private fun logNewEpoch(logEpoch: Int, processedEpoch: Int) {
             LOG.info(
                 "Starting node with a log at a later epoch than the latest processed message " +
@@ -554,6 +563,7 @@ class Database(
             @JvmField
             val EMPTY = object : Catalog {
                 override val databaseNames: Collection<DatabaseName> = emptySet()
+                override val abandonedDatabases: Map<DatabaseName, Config> = emptyMap()
                 override val txScoped = false
 
                 override fun databaseOrNull(dbName: DatabaseName) = null
@@ -660,5 +670,16 @@ class Database(
         val serialisedSecondaryDatabases: Map<DatabaseName, DatabaseConfig>
             get() = this.filterNot { it.name == "xtdb" }
                 .associate { db -> db.name to db.config.serializedConfig }
+
+        /**
+         * Names this node has stopped putting back up, whether or not a database is still behind
+         * them to answer reads. What they have in common is that nothing is coming to change it,
+         * which is what separates them from one waiting out a backoff — and an ingestion error
+         * alone cannot: both carry one.
+         *
+         * Abstract rather than defaulted, so an implementation has to answer for itself: a JVM
+         * default is intercepted rather than run by a mocked catalog, which would then report none.
+         */
+        val abandonedDatabases: Map<DatabaseName, Config>
     }
 }

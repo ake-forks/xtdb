@@ -17,7 +17,7 @@
            (xtdb.api.log SourceMessage$FlushBlock)
            (xtdb.api.metrics Healthz HealthzConfig)
            xtdb.api.Xtdb$Config
-           (xtdb.database Database Database$Catalog)
+           (xtdb.database Database Database$Catalog Database$Config)
            xtdb.NodeBase
            xtdb.storage.BufferPoolKt))
 
@@ -29,6 +29,18 @@
         latest-available (BufferPoolKt/latestAvailableBlockIndex (.getBufferPool db) current-block)]
     (max 0 (- (or latest-available -1)
               (or current-block -1)))))
+
+(defn abandoned-problems
+  "Databases this node has stopped putting back up. An ingestion error alone doesn't tell you this -
+   one waiting out a backoff carries one too, and taking a node out of service for that would undo
+   the point of restarting a single database. The catalog is what knows the difference."
+  [db-cat abandoned]
+  (for [[db-name ^Database$Config config] abandoned]
+    {:db db-name
+     :critical (Database/isCritical db-name config)
+     ;; a stopped database still resolves, so its own error is available to report
+     :ingestion-error (some-> (.databaseOrNull ^Database$Catalog db-cat ^String db-name) get-ingestion-error)
+     :abandoned? true}))
 
 (defn- all-databases
   "Returns all currently attached databases from the catalog."
@@ -82,36 +94,32 @@
                 ["/healthz/alive" {:name :alive
                                    :get (fn [{:keys [^Database$Catalog db-cat]}]
                                           (let [dbs (all-databases db-cat)
-                                                problems (for [^Database db dbs
-                                                               :let [db-name (.getName db)
-                                                                     critical (.isCritical db)
-                                                                     ingestion-error (get-ingestion-error db)
-                                                                     block-lag (->block-lag db)
-                                                                     block-lag-healthy? (<= block-lag 5)]
-                                                               :when (or ingestion-error (not block-lag-healthy?))]
-                                                           {:db db-name
-                                                            :critical critical
-                                                            :ingestion-error ingestion-error
-                                                            :block-lag block-lag
-                                                            :block-lag-healthy? block-lag-healthy?})
+                                                abandoned (abandoned-problems db-cat (.getAbandonedDatabases db-cat))
+                                                lagging (for [^Database db dbs
+                                                              :let [db-name (.getName db)
+                                                                    block-lag (->block-lag db)]
+                                                              :when (> block-lag 5)]
+                                                          {:db db-name
+                                                           :critical (.isCritical db)
+                                                           :block-lag block-lag})
+                                                problems (concat lagging abandoned)
                                                 critical-problems (filter :critical problems)]
 
-                                            (doseq [{:keys [db ingestion-error block-lag block-lag-healthy?]} problems]
-                                              (if ingestion-error
-                                                (log/error (format "Ingestion error detected for database '%s': %s" db ingestion-error))
-                                                (when-not block-lag-healthy?
-                                                  (log/warn (format "Block lag for database '%s' is %d blocks, exceeds healthy threshold" db block-lag)))))
+                                            (doseq [{:keys [db ingestion-error block-lag abandoned?]} problems]
+                                              (if abandoned?
+                                                (log/error (format "Database '%s' has stopped ingesting and will not be put back up: %s" db ingestion-error))
+                                                (log/warn (format "Block lag for database '%s' is %d blocks, exceeds healthy threshold" db block-lag))))
 
-                                            (cond-> {:headers {"X-XTDB-Databases-Checked" (str (count dbs))
+                                            (cond-> {:headers {"X-XTDB-Databases-Checked" (str (+ (count dbs) (count abandoned)))
                                                                "X-XTDB-Databases-Unhealthy" (str (count problems))}}
 
                                               (seq critical-problems)
                                               (assoc :status 503
                                                      :body (str "Unhealthy: "
                                                                 (->> critical-problems
-                                                                     (map (fn [{:keys [db ingestion-error block-lag]}]
-                                                                            (if ingestion-error
-                                                                              (format "%s (ingestion error: %s)" db ingestion-error)
+                                                                     (map (fn [{:keys [db ingestion-error block-lag abandoned?]}]
+                                                                            (if abandoned?
+                                                                              (format "%s (not being put back up: %s)" db ingestion-error)
                                                                               (format "%s (block lag: %d)" db block-lag))))
                                                                      (str/join ", "))))
 

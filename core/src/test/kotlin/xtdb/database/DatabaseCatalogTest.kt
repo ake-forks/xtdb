@@ -66,6 +66,25 @@ class DatabaseCatalogTest {
 
                 assertSame(first, catalog.databaseOrNull("test_db"), "still the database that stopped")
                 assertNotNull(first.ingestionError, "and still carrying why it stopped")
+                assertTrue("test_db" !in catalog.abandonedDatabases, "a replacement is due, so it is not abandoned")
+            }
+        }
+    }
+
+    @Test
+    fun `a database nothing will put back up says so`() {
+        NodeBase.openBase(openMeterRegistry = false).use { base ->
+            DatabaseCatalog.open(base, restartBaseBackoff = 1.milliseconds).use { catalog ->
+                catalog.attach("test_db", Database.Config())
+                val first = catalog.databaseOrNull("test_db")!!
+
+                first.watchers.notifyError(Incorrect("poison record", "xtdb/test-incorrect"))
+
+                eventually("the database to be reported as abandoned") {
+                    catalog.abandonedDatabases.keys.contains("test_db").takeIf { it }
+                }
+
+                assertSame(first, catalog.databaseOrNull("test_db"), "and it still answers reads")
             }
         }
     }
