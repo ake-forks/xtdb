@@ -120,6 +120,9 @@ class Database(
     val latestProcessedMsgId: MessageId get() = watchers.latestSourceMsgId
     val ingestionError: IngestionStoppedException? get() = watchers.exception
 
+    /** Suspending counterpart of [ingestionError]. */
+    suspend fun awaitFailure(): Watchers.Failure = watchers.awaitFailure()
+
     /** Whether an ingestion error here should take the whole node out of service. */
     val isCritical: Boolean get() = name == "xtdb" || config.critical
 

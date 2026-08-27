@@ -136,5 +136,17 @@ class Watchers(
         activeState.first { it.latestSourceMsgId >= srcMsgId }
     }
 
+    data class Failure(
+        val exception: IngestionStoppedException,
+
+        // an ext-source tx is staged at the source-log position the resolver already held, so the
+        // msg-id never advances for an ext-source database at all
+        val latestTxId: TxId,
+    )
+
+    /** Returns at once if ingestion has already stopped, so a late caller misses nothing. */
+    suspend fun awaitFailure(): Failure =
+        state.filterIsInstance<Failed>().first().let { Failure(it.exception, it.latestTxId) }
+
     override fun toString() = state.toString()
 }

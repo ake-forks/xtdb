@@ -82,6 +82,48 @@ class WatchersTest {
     }
 
     @Test
+    fun `awaitFailure reports why ingestion stopped and how far it had got`() = runTest(timeout = 1.seconds) {
+        val watchers = Watchers(latestTxId = 3, latestSourceMsgId = 3, latestReplicaMsgId = -1)
+        val failure = async { watchers.awaitFailure() }
+
+        assertThrows<TimeoutCancellationException> { withTimeout(50) { failure.await() } }
+
+        val tx4 = TransactionResult.Committed(TransactionKey(4, Instant.parse("2026-01-01T00:00:00Z")))
+        watchers.notifyApplied(null, 4, tx4)
+
+        val ex = Exception("test")
+        watchers.notifyError(ex)
+
+        assertEquals(ex, failure.await().exception.cause)
+        assertEquals(4, failure.await().latestTxId)
+    }
+
+    @Test
+    fun `a database that stopped before anything listened still reports it`() = runTest(timeout = 1.seconds) {
+        val watchers = Watchers(latestTxId = 3, latestSourceMsgId = 3, latestReplicaMsgId = -1)
+        val ex = Exception("test")
+        watchers.notifyError(ex)
+
+        val failure = withTimeout(50) { watchers.awaitFailure() }
+
+        assertEquals(ex, failure.exception.cause)
+        assertEquals(3, failure.latestTxId)
+    }
+
+    @Test
+    fun `the failure position advances for an ext-source database, where the source msg id does not`() =
+        runTest(timeout = 1.seconds) {
+            val watchers = Watchers(latestTxId = 5, latestSourceMsgId = 100, latestReplicaMsgId = -1)
+
+            val tx6 = TransactionResult.Committed(TransactionKey(6, Instant.parse("2026-05-01T00:00:00Z")))
+            watchers.notifyApplied(null, watchers.latestSourceMsgId, tx6)
+            watchers.notifyError(Exception("test"))
+
+            assertEquals(6, watchers.awaitFailure().latestTxId)
+            assertEquals(100, watchers.latestSourceMsgId)
+        }
+
+    @Test
     fun `handles ingestion stopped`() = runTest(timeout = 1.seconds) {
         supervisorScope {
             val watchers = Watchers(latestTxId = 3, latestSourceMsgId = 3, latestReplicaMsgId = -1)
