@@ -6,7 +6,9 @@
 -- Scope: one node's set of databases, and the transitions between the states below.
 -- Excludes: everything that happens INSIDE a running database.
 -- Transaction processing, block flushing and query execution are db.allium's; leader election is log-processor-lifecycle.allium's.
--- Here a running database is opaque: it either resolves by name or it does not.
+-- Here a running database is opaque but for its reporting that ingestion has stopped, and for how far it had got when it did.
+-- A database has made progress when the point it has reached is further on than at its last failure.
+-- What ingestion is, what that point counts, and why it stops, are db.allium's; this spec carries only what the node does once it has.
 --
 -- The words below recur, and they nest.
 --
@@ -29,14 +31,31 @@
 -- A durable_record node reads its set at startup and hands it to the recorder thereafter.
 -- A fixed node is given its whole set by the operator and never writes one.
 -- HOLD and RESOLVE apply to both.
--- The membership instructions and the membership surface exist only on a durable_record node, and a fixed node reaches only `Open`.
+-- The membership instructions and the membership surface exist only on a durable_record node.
+-- A fixed node is told to admit and to remove nothing, so nothing on it is ever skipped or detached.
 --
 -- Attach and detach are cluster-wide instructions -- every node receives them and applies them to its own set independently.
 -- This spec describes what ONE node does with them; how an instruction reaches the node belongs to db.allium.
 --
--- The states a held name can be in, of which only `Open` is reachable on a fixed node.
+-- The states a held name can be in.
 --
 -- - Open -- held, a member, resolvable.
+--
+-- - Recovering -- held, a member, and resolvable, with a replacement due.
+--   Ingestion has stopped, and this node will open another database in its place.
+--   Reads are still answered, at the basis it had reached.
+--
+-- - Stopped -- held, a member, and resolvable, with nothing being done about it.
+--   Ingestion has stopped and this node will not restart the database: the fault is one that would recur identically, its attempts are spent, or it is the primary.
+--   Reads are still answered, at the basis it had reached.
+--
+-- - Restarting -- held and a member, not resolvable.
+--   The database behind the name has been released, and another is being opened in its place.
+--   It stays a member throughout, because a set handed over without it would erase the database.
+--
+-- - Stranded -- held and a member, not resolvable.
+--   Recovery ended with nothing behind the name.
+--   An operator removes it or restarts the node; this node will do nothing further with it.
 --
 -- - Skipped -- held and a member, not resolvable.
 --   The operator has designated that this node must not run it, and it stays in the set all the same.
@@ -52,7 +71,7 @@
 --
 -- - It is in no set the node hands over, which tells the recorder no such database exists.
 --
--- Skipped stays a member because a node that declined to run a database and dropped it from its set would delete it.
+-- Every state but Detaching stays a member, because a node that dropped one from its set would delete the database rather than leave it alone.
 -- Detaching stays held because a database's resources have to be fully released before anything may take its place.
 -- Its record keeps the name occupied for as long as that takes, while the removal itself has already taken effect.
 
@@ -63,6 +82,17 @@
 external entity DatabaseConfig {
     -- The durable description of a database: where its log and storage live, and how it is to be run.
     -- Opaque here -- this spec carries it from instruction to entry and hands it back in the membership set, and never inspects it.
+}
+
+external entity Ingestion {
+    -- The work a running database does to take in records and make them readable.
+    -- Opaque here -- this spec observes only that it has stopped, and the point it had reached.
+}
+
+external entity Fault {
+    -- Why ingestion stopped.
+    -- Opaque but for whose fault it is: one in what was submitted recurs identically however many times the database is restarted.
+    caller_fault: Boolean
 }
 
 external entity Cluster {
@@ -83,6 +113,13 @@ external entity MembershipRecord {
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
+
+value Recovery {
+    -- A run of failures a database has not got past.
+    -- The count and the point reached begin, advance and end together, so they are one value: a database in no such run has none.
+    attempts: Integer
+    position: Integer
+}
 
 value ConfiguredDatabase {
     -- One entry in the set an operator hands a fixed node when it starts.
@@ -115,8 +152,8 @@ entity DatabaseCatalog {
     entries: DatabaseEntry with catalog = this
 
     -- Projections
-    resolvable: entries where lifecycle = Open
-    members: entries where lifecycle in {Open, Skipped}
+    resolvable: entries where lifecycle in {Open, Recovering, Stopped}
+    members: entries where lifecycle in {Open, Recovering, Stopped, Restarting, Stranded, Skipped}
 
     -- Derived
     -- Whether this node holds a record for a name, in any state.
@@ -131,19 +168,51 @@ entity DatabaseEntry {
     catalog: DatabaseCatalog
     name: String
     config: DatabaseConfig
-    lifecycle: Open | Detaching | Skipped
+    lifecycle: Open | Recovering | Stopped | Restarting | Stranded | Skipped | Detaching
 
     transitions lifecycle {
+        Open -> Recovering
+        Open -> Stopped
         Open -> Detaching
-        terminal: Detaching, Skipped
+        Recovering -> Restarting
+        Recovering -> Detaching
+        Stopped -> Detaching
+        Restarting -> Open
+        Restarting -> Stranded
+        Restarting -> Detaching
+        terminal: Detaching, Skipped, Stranded
     }
 }
 
-variant Open : DatabaseEntry { }
+variant Open : DatabaseEntry {
+    -- The run of failures this database is in, and absent while it is in none.
+    -- An Open database carries one across a restart, so a replacement that stops in the same place goes on counting rather than starting again.
+    recovery: Recovery?
+}
 
-variant Detaching : DatabaseEntry { }
+variant Recovering : DatabaseEntry {
+    -- A replacement is due, so there is always a run behind it.
+    recovery: Recovery
+}
+
+variant Restarting : DatabaseEntry {
+    -- A restart follows a failure, so there is always a run behind it.
+    recovery: Recovery
+}
+
+variant Stopped : DatabaseEntry {
+    -- Why ingestion stopped, and why nothing is being done about it.
+    fault: Fault
+}
+
+variant Stranded : DatabaseEntry {
+    -- Why recovery ended.
+    fault: Fault
+}
 
 variant Skipped : DatabaseEntry { }
+
+variant Detaching : DatabaseEntry { }
 
 ------------------------------------------------------------
 -- Config
@@ -156,6 +225,10 @@ config {
 
     -- The database every node has as a member, and the only one that cannot be removed.
     primary_database: String = "xtdb"
+
+    -- How long a run of failures may get, counting the one that began it, before the database is left alone.
+    -- Spending them leaves it readable and reported rather than removed, so an operator still finds it where they left it.
+    max_restart_attempts: Integer = 8
 
     -- A fixed node's whole set, supplied by the operator when the node starts.
     -- Empty on a durable_record node, which reads its set instead.
@@ -177,7 +250,7 @@ rule StartupCreatesFixedSet {
 
     for configured in config.fixed_databases:
         ensures: Open.created(
-            catalog: catalog, name: configured.name, config: configured.config
+            catalog: catalog, name: configured.name, config: configured.config, recovery: null
         )
 }
 
@@ -196,7 +269,7 @@ rule AdmitInstructionCreatesEntry {
             )
         else:
             Open.created(
-                catalog: catalog, name: db_name, config: db_config
+                catalog: catalog, name: db_name, config: db_config, recovery: null
             )
 }
 
@@ -208,6 +281,95 @@ rule AdmitRefusedWhenAlreadyHeld {
     requires: catalog.holds(db_name)
 
     ensures: AdmitRefused(db_name: db_name)
+}
+
+---- Ingestion stopping, and the database coming back
+
+rule FailureBeginsARunOfRecovery {
+    -- A database that stops ingesting is due to be replaced, so that a fault which has since cleared costs no more than the time to notice it.
+    -- It answers reads at the basis it had reached until the replacement is opened.
+    -- The count bounds a run of failures, not a database's lifetime, so one that got further than it did last time is restarted as freely as one that never failed.
+    when: IngestionStopped(db_name, fault, position)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: exists entry
+    requires: entry.lifecycle = Open
+    requires: db_name != config.primary_database
+    requires: not fault.caller_fault
+    requires: entry.recovery = null or position > entry.recovery.position
+
+    ensures: entry.lifecycle = Recovering
+    ensures: entry.recovery = Recovery(attempts: 1, position: position)
+}
+
+rule RepeatedFailureContinuesTheRun {
+    -- A database that got no further than last time has recovered from nothing, so this failure counts against what recovery it has left.
+    -- It answers reads meanwhile, as one whose run has just begun does.
+    when: IngestionStopped(db_name, fault, position)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: exists entry
+    requires: entry.lifecycle = Open
+    requires: db_name != config.primary_database
+    requires: not fault.caller_fault
+    requires: entry.recovery != null and position <= entry.recovery.position
+    requires: entry.recovery.attempts < config.max_restart_attempts
+
+    ensures: entry.lifecycle = Recovering
+    ensures: entry.recovery = Recovery(attempts: entry.recovery.attempts + 1, position: position)
+}
+
+rule PrimaryIsNotRestarted {
+    -- A restart rewinds a database to its last durable point and replays from there, which is safe only for state that database owns.
+    -- The primary's log processor also applies the cluster's membership instructions, and those mutate the node's catalog.
+    -- No restart of one database rewinds that, so a replayed instruction meets its own earlier effect and resolves a second time -- and it is the resolution, not the instruction, that every node applies.
+    when: IngestionStopped(db_name, fault, position)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: exists entry
+    requires: entry.lifecycle = Open
+    requires: db_name = config.primary_database
+
+    ensures: entry.lifecycle = Stopped
+    ensures: entry.fault = fault
+}
+
+rule FailureStopsDatabase {
+    -- The database stays where it is, readable and reported, and this node does nothing further with it.
+    -- A caller fault would recur identically on every attempt; a run of failures that got no further each time has bought all the recovery on offer.
+    when: IngestionStopped(db_name, fault, position)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: exists entry
+    requires: entry.lifecycle = Open
+    requires: db_name != config.primary_database
+    requires: fault.caller_fault or (entry.recovery != null and position <= entry.recovery.position and entry.recovery.attempts >= config.max_restart_attempts)
+
+    ensures: entry.lifecycle = Stopped
+    ensures: entry.fault = fault
+}
+
+rule ReplacementBeginsRestart {
+    -- A node judges for itself when a replacement is due, and it MAY wait longer after each failure of a run.
+    -- The name stops resolving at this point, where the database behind it is released.
+    when: ReplacementDue(entry)
+    requires: entry.lifecycle = Recovering
+
+    ensures: entry.lifecycle = Restarting
+}
+
+rule ReplacementCompletesRestart {
+    -- The database behind the name is a new one, holding no more than the durable record it read on the way up.
+    -- Its run carries over untouched, so one that opens and stops in the same place is not restarted afresh.
+    when: ReplacementOpened(entry)
+    requires: entry.lifecycle = Restarting
+
+    ensures: entry.lifecycle = Open
+}
+
+rule AbandonedRecoveryStrandsDatabase {
+    -- The name keeps its place in the set, so that a node which gave up does not thereby delete the database.
+    when: RecoveryAbandoned(entry, fault)
+    requires: entry.lifecycle = Restarting
+
+    ensures: entry.lifecycle = Stranded
+    ensures: entry.fault = fault
 }
 
 ---- Entries going away
@@ -242,7 +404,7 @@ rule RemoveBeginsTeardown {
     requires: catalog.membership_source = durable_record
     requires: db_name != config.primary_database
     requires: exists entry
-    requires: entry.lifecycle = Open
+    requires: entry.lifecycle in {Open, Recovering, Stopped, Restarting}
 
     ensures: entry.lifecycle = Detaching
 }
@@ -255,6 +417,18 @@ rule RemoveDropsSkippedEntry {
     requires: db_name != config.primary_database
     requires: exists entry
     requires: entry.lifecycle = Skipped
+
+    ensures: not exists entry
+}
+
+rule RemoveDropsStrandedEntry {
+    -- Nothing is behind a Stranded name, so it has nothing to release and goes straight out.
+    when: NodeInstructedToRemove(db_name)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: catalog.membership_source = durable_record
+    requires: db_name != config.primary_database
+    requires: exists entry
+    requires: entry.lifecycle = Stranded
 
     ensures: not exists entry
 }
@@ -304,6 +478,10 @@ actor ClusterControl {
     identified_by: Cluster where true
 }
 
+actor Ingester {
+    identified_by: Ingestion where true
+}
+
 actor Recorder {
     identified_by: MembershipRecord where true
 }
@@ -331,6 +509,24 @@ surface MembershipInstructions {
         -- Refusing an instruction leaves this node's set exactly as it was.
 }
 
+surface IngestionSignals {
+    facing ingester: Ingester
+
+    provides:
+        IngestionStopped(ingester, db_name, fault, position)
+
+    @guarantee StoppingIsReportedOnce
+        -- A database reports that its ingestion has stopped once; the next such report comes from the database that replaced it.
+
+    @guarantee StoppingCarriesThePointReached
+        -- The point a database reports is the one it had reached when its ingestion stopped, and it does not go backwards between a database and the one that replaced it.
+        -- A node has no other way to tell a database recovering between failures from one failing in the same place every time, and the two are owed different treatment.
+
+    @guarantee RecoveryIsBoundedByFailuresSinceProgress
+        -- A run of failures is at most `max_restart_attempts` long, counting the one that began it, and the database is replaced after each of them.
+        -- A failure at a further point begins a new run, so a database that fails after periods of progress goes on being replaced.
+}
+
 surface DatabaseResolution {
     facing caller: Client
 
@@ -343,8 +539,8 @@ surface DatabaseResolution {
     provides:
         ResolveDatabase(caller, db_name)
 
-    @guarantee OnlyOpenDatabasesResolve
-        -- A name resolves only while this node holds an Open database behind it.
+    @guarantee ResolutionNeedsADatabaseToAnswer
+        -- A name resolves only while this node holds a database behind it ready to answer.
         -- Of any other held name a caller sees nothing at all: not the name, not that it exists.
         -- It therefore cannot tell one from a name this node never held.
 }
