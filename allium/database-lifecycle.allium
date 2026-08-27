@@ -29,19 +29,19 @@
 -- A durable_record node reads its set at startup and hands it to the recorder thereafter.
 -- A fixed node is given its whole set by the operator and never writes one.
 -- HOLD and RESOLVE apply to both.
--- The membership instructions and the membership surface exist only on a durable_record node, and a fixed node reaches only `open`.
+-- The membership instructions and the membership surface exist only on a durable_record node, and a fixed node reaches only `Open`.
 --
 -- Attach and detach are cluster-wide instructions -- every node receives them and applies them to its own set independently.
 -- This spec describes what ONE node does with them; how an instruction reaches the node belongs to db.allium.
 --
--- The states a held name can be in, of which only `open` is reachable on a fixed node.
+-- The states a held name can be in, of which only `Open` is reachable on a fixed node.
 --
--- - open -- held, a member, resolvable.
+-- - Open -- held, a member, resolvable.
 --
--- - skipped -- held and a member, not resolvable.
+-- - Skipped -- held and a member, not resolvable.
 --   The operator has designated that this node must not run it, and it stays in the set all the same.
 --
--- - detaching -- held only.
+-- - Detaching -- held only.
 --   No longer a member, so already gone from the durable record, but still occupying its name until its resources are released.
 --
 -- A name this node has no entry for is ABSENT.
@@ -115,8 +115,8 @@ entity DatabaseCatalog {
     entries: DatabaseEntry with catalog = this
 
     -- Projections
-    resolvable: entries where lifecycle = open
-    members: entries where lifecycle in {open, skipped}
+    resolvable: entries where lifecycle = Open
+    members: entries where lifecycle in {Open, Skipped}
 
     -- Derived
     -- Whether this node holds a record for a name, in any state.
@@ -126,18 +126,24 @@ entity DatabaseCatalog {
 
 entity DatabaseEntry {
     -- This node's record of a database: its name, the config it would run under, and whether it resolves.
-    -- A record exists whether or not anything runs behind it -- a skipped entry is a name and a config and nothing more.
+    -- A record exists whether or not anything runs behind it -- a Skipped entry is a name and a config and nothing more.
 
     catalog: DatabaseCatalog
     name: String
     config: DatabaseConfig
-    lifecycle: open | detaching | skipped
+    lifecycle: Open | Detaching | Skipped
 
     transitions lifecycle {
-        open -> detaching
-        terminal: detaching, skipped
+        Open -> Detaching
+        terminal: Detaching, Skipped
     }
 }
+
+variant Open : DatabaseEntry { }
+
+variant Detaching : DatabaseEntry { }
+
+variant Skipped : DatabaseEntry { }
 
 ------------------------------------------------------------
 -- Config
@@ -170,28 +176,27 @@ rule StartupCreatesFixedSet {
     requires: catalog.membership_source = fixed
 
     for configured in config.fixed_databases:
-        ensures: DatabaseEntry.created(
-            catalog: catalog, name: configured.name, config: configured.config,
-            lifecycle: open
+        ensures: Open.created(
+            catalog: catalog, name: configured.name, config: configured.config
         )
 }
 
 rule AdmitInstructionCreatesEntry {
     -- An instruction naming something this node does not hold makes it a member: the record comes into being and joins the set either way.
     -- It resolves too, unless the operator has designated it as one to skip.
-    -- A skipped name is still a member, because membership is what keeps a database in existence.
+    -- A Skipped name is still a member, because membership is what keeps a database in existence.
     when: NodeInstructedToAdmit(db_name, db_config)
     requires: catalog.membership_source = durable_record
     requires: not catalog.holds(db_name)
 
     ensures:
         if db_name in config.skipped_databases:
-            DatabaseEntry.created(
-                catalog: catalog, name: db_name, config: db_config, lifecycle: skipped
+            Skipped.created(
+                catalog: catalog, name: db_name, config: db_config
             )
         else:
-            DatabaseEntry.created(
-                catalog: catalog, name: db_name, config: db_config, lifecycle: open
+            Open.created(
+                catalog: catalog, name: db_name, config: db_config
             )
 }
 
@@ -229,7 +234,7 @@ rule RemoveRefusedForAbsentName {
 }
 
 rule RemoveBeginsTeardown {
-    -- An open database is torn down before it goes.
+    -- An Open database is torn down before it goes.
     -- It stops resolving and stops being a member the moment the instruction arrives, so it is already out of the durable record.
     -- It goes on being held while its resources are released.
     when: NodeInstructedToRemove(db_name)
@@ -237,19 +242,19 @@ rule RemoveBeginsTeardown {
     requires: catalog.membership_source = durable_record
     requires: db_name != config.primary_database
     requires: exists entry
-    requires: entry.lifecycle = open
+    requires: entry.lifecycle = Open
 
-    ensures: entry.lifecycle = detaching
+    ensures: entry.lifecycle = Detaching
 }
 
 rule RemoveDropsSkippedEntry {
-    -- A skipped database has nothing open behind it, so it has nothing to release and goes straight out.
+    -- A Skipped database has nothing behind it, so it has nothing to release and goes straight out.
     when: NodeInstructedToRemove(db_name)
     let entry = DatabaseEntry{catalog, name: db_name}
     requires: catalog.membership_source = durable_record
     requires: db_name != config.primary_database
     requires: exists entry
-    requires: entry.lifecycle = skipped
+    requires: entry.lifecycle = Skipped
 
     ensures: not exists entry
 }
@@ -261,7 +266,7 @@ rule RemoveRefusedWhileTearingDown {
     requires: catalog.membership_source = durable_record
     requires: db_name != config.primary_database
     requires: exists entry
-    requires: entry.lifecycle = detaching
+    requires: entry.lifecycle = Detaching
 
     ensures: RemoveRefused(db_name: db_name)
 }
@@ -270,7 +275,7 @@ rule TeardownCompletesRemoval {
     -- The record goes only once the database has released its resources.
     -- Until then it occupies its name, which is what stops a re-admission racing its own teardown.
     when: TeardownCompleted(entry)
-    requires: entry.lifecycle = detaching
+    requires: entry.lifecycle = Detaching
 
     ensures: not exists entry
 }
@@ -339,7 +344,7 @@ surface DatabaseResolution {
         ResolveDatabase(caller, db_name)
 
     @guarantee OnlyOpenDatabasesResolve
-        -- A name resolves only while this node holds an open database behind it.
+        -- A name resolves only while this node holds an Open database behind it.
         -- Of any other held name a caller sees nothing at all: not the name, not that it exists.
         -- It therefore cannot tell one from a name this node never held.
 }
