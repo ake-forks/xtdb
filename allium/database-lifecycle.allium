@@ -19,14 +19,16 @@
 --   That record outlives every node, so membership is what keeps a database in existence.
 --   Dropping one from the set -- deliberately, or by losing track of it -- deletes it.
 --
--- - RUN -- the database is working: indexing, and resolvable by name.
+-- - RESOLVE -- the catalog answers this name with a database ready to serve the caller.
+--   A held name that does not resolve may have no database behind it, or one the catalog will not hand out.
+--   What the database then does with the request -- how current its answer is, whether it is still taking in records -- is db.allium's.
 --
--- A running database is a member, and a member is held; neither converse holds.
+-- A resolvable database is a member, and a member is held; neither converse holds.
 --
 -- The MEMBER axis only exists where a node writes the record back, and `membership_source` says which kind of node this is.
 -- A durable_record node reads its set at startup and hands it to the recorder thereafter.
 -- A fixed node is given its whole set by the operator and never writes one.
--- HOLD and RUN apply to both.
+-- HOLD and RESOLVE apply to both.
 -- The membership instructions and the membership surface exist only on a durable_record node, and a fixed node reaches only `open`.
 --
 -- Attach and detach are cluster-wide instructions -- every node receives them and applies them to its own set independently.
@@ -34,9 +36,9 @@
 --
 -- The states a held name can be in, of which only `open` is reachable on a fixed node.
 --
--- - open -- held, a member, running.
+-- - open -- held, a member, resolvable.
 --
--- - skipped -- held and a member, not running.
+-- - skipped -- held and a member, not resolvable.
 --   The operator has designated that this node must not run it, and it stays in the set all the same.
 --
 -- - detaching -- held only.
@@ -123,7 +125,7 @@ entity DatabaseCatalog {
 }
 
 entity DatabaseEntry {
-    -- This node's record of a database: its name, the config it would run under, and whether it is running.
+    -- This node's record of a database: its name, the config it would run under, and whether it resolves.
     -- A record exists whether or not anything runs behind it -- a skipped entry is a name and a config and nothing more.
 
     catalog: DatabaseCatalog
@@ -176,7 +178,7 @@ rule StartupCreatesFixedSet {
 
 rule AdmitInstructionCreatesEntry {
     -- An instruction naming something this node does not hold makes it a member: the record comes into being and joins the set either way.
-    -- It runs too, unless the operator has designated it as one to skip.
+    -- It resolves too, unless the operator has designated it as one to skip.
     -- A skipped name is still a member, because membership is what keeps a database in existence.
     when: NodeInstructedToAdmit(db_name, db_config)
     requires: catalog.membership_source = durable_record
@@ -227,8 +229,8 @@ rule RemoveRefusedForAbsentName {
 }
 
 rule RemoveBeginsTeardown {
-    -- A running database is torn down before it goes.
-    -- It stops running and stops being a member the moment the instruction arrives, so it is already out of the durable record.
+    -- An open database is torn down before it goes.
+    -- It stops resolving and stops being a member the moment the instruction arrives, so it is already out of the durable record.
     -- It goes on being held while its resources are released.
     when: NodeInstructedToRemove(db_name)
     let entry = DatabaseEntry{catalog, name: db_name}
@@ -241,7 +243,7 @@ rule RemoveBeginsTeardown {
 }
 
 rule RemoveDropsSkippedEntry {
-    -- A skipped database is running nothing, so it has nothing to release and goes straight out.
+    -- A skipped database has nothing open behind it, so it has nothing to release and goes straight out.
     when: NodeInstructedToRemove(db_name)
     let entry = DatabaseEntry{catalog, name: db_name}
     requires: catalog.membership_source = durable_record
@@ -336,9 +338,9 @@ surface DatabaseResolution {
     provides:
         ResolveDatabase(caller, db_name)
 
-    @guarantee OnlyRunningDatabasesResolve
-        -- A name resolves only while the database behind it runs.
-        -- A caller sees nothing at all of a held name that is not running: not the name, not that it exists.
+    @guarantee OnlyOpenDatabasesResolve
+        -- A name resolves only while this node holds an open database behind it.
+        -- Of any other held name a caller sees nothing at all: not the name, not that it exists.
         -- It therefore cannot tell one from a name this node never held.
 }
 
