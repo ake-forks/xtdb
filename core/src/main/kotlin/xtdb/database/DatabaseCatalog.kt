@@ -2,7 +2,10 @@ package xtdb.database
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -121,6 +124,9 @@ class DatabaseCatalog @JvmOverloads constructor(
     // has been opened is closed on the way out rather than left behind.
     private val restartJob = SupervisorJob(dbJob)
     private val restartScope = CoroutineScope(restartJob + closerDispatcher)
+
+    /** How many supervisors are still watching a database — one per name this node expects to keep. */
+    internal val liveSupervisors: Int get() = restartJob.children.count()
 
     override val databaseNames: Collection<DatabaseName>
         get() = entries.entries.asSequence().filter { it.value is Entry.Resolvable }.map { it.key }.toSet()
@@ -273,6 +279,17 @@ class DatabaseCatalog @JvmOverloads constructor(
      * than it did last time has recovered from whatever stopped it before, and starts again at one.
      * That position is a tx-id — see [Watchers.Failure].
      */
+    /** Whichever comes first: this database failing, or someone else tearing it down. Null for the latter. */
+    private suspend fun awaitFailureOrTeardown(db: Database): Watchers.Failure? = coroutineScope {
+        val failure = async { db.awaitFailure() }
+        val teardown = async { db.awaitTeardown() }
+
+        select {
+            failure.onAwait { teardown.cancel(); it }
+            teardown.onAwait { failure.cancel(); null }
+        }
+    }
+
     private fun supervise(dbName: DatabaseName, installed: Entry.Open) = restartScope.launch {
         var current: Entry.Resolvable = installed
         var attempts = 0
@@ -280,7 +297,11 @@ class DatabaseCatalog @JvmOverloads constructor(
 
         while (true) {
             val db = current.db
-            val failure = db.awaitFailure()
+
+            // Whoever tears this database down is not obliged to fail it -- a clean teardown never
+            // reaches the watchers -- so waiting on the failure alone parks here for the rest of the
+            // node's life, holding a database that has already been closed and replaced by nobody.
+            val failure = awaitFailureOrTeardown(db) ?: return@launch
 
             attempts = if (failure.latestTxId > lastFailedAt) 1 else attempts + 1
             lastFailedAt = failure.latestTxId

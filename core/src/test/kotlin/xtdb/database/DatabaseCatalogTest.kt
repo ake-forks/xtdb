@@ -53,6 +53,26 @@ class DatabaseCatalogTest {
     }
 
     @Test
+    fun `detaching a database releases the supervisor watching it`() {
+        NodeBase.openBase(openMeterRegistry = false).use { base ->
+            DatabaseCatalog.open(base, restartBaseBackoff = 1.milliseconds).use { catalog ->
+                val before = catalog.liveSupervisors
+
+                catalog.attach("test_db", Database.Config())
+                assertEquals(before + 1, catalog.liveSupervisors, "attaching arms one")
+
+                catalog.detach("test_db")
+
+                // A teardown never fails the watchers, so a supervisor waiting only on a failure
+                // would sit here holding a closed database for the rest of the node's life.
+                eventually("the supervisor to notice its database has gone") {
+                    Unit.takeIf { catalog.liveSupervisors == before }
+                }
+            }
+        }
+    }
+
+    @Test
     fun `a database waiting to be replaced goes on answering reads`() {
         NodeBase.openBase(openMeterRegistry = false).use { base ->
             // long enough that the wait is observable; under it the name must still resolve

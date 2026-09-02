@@ -150,6 +150,18 @@ class Database(
     // instead, so its owner cancel-joins on its behalf and only `close` runs per database.
     suspend fun cancelAndJoin() = job?.cancelAndJoin()
 
+    /**
+     * Suspends until this database's job tree has been cancel-joined by whoever owns it.
+     *
+     * A teardown deliberately never reaches [Watchers.notifyError] — [awaitFailure] is absorbing, so
+     * a clean shutdown would poison every later read — which leaves anything waiting on a failure
+     * waiting on a database that has already gone. This is the other half of that wait.
+     *
+     * A database with no job tree has nothing to tear down and nothing to fail, so this never
+     * returns for one: an immediate return would read as "already gone" to a caller racing the two.
+     */
+    suspend fun awaitTeardown(): Unit = job?.join() ?: awaitCancellation()
+
     override fun close() {
         // Phase 2: the job tree has already been cancel-joined (by `cancelAndJoin` above, or by the
         // owner cancelling the catalog root). Free state, children before the database allocator.
