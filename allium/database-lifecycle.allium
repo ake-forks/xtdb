@@ -345,6 +345,26 @@ rule FailureStopsDatabase {
     ensures: entry.fault = fault
 }
 
+rule ResolutionRefusedWhileReplacing {
+    -- The wait is this node's, not the caller's, so a name being reopened is answerable as one to try again.
+    when: ResolveDatabase(db_name)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: exists entry
+    requires: entry.lifecycle = Restarting
+
+    ensures: ResolveDeferred(db_name: db_name)
+}
+
+rule ResolutionRefusedWhenRecoveryEnded {
+    -- The database is a member and this node will do nothing further with it, which no other answer to a caller conveys.
+    when: ResolveDatabase(db_name)
+    let entry = DatabaseEntry{catalog, name: db_name}
+    requires: exists entry
+    requires: entry.lifecycle = Stranded
+
+    ensures: ResolveRefused(db_name: db_name)
+}
+
 rule ReplacementBeginsRestart {
     -- A node judges for itself when a replacement is due, and it MAY wait longer after each failure of a run.
     -- The name stops resolving at this point, where the database behind it is released.
@@ -541,8 +561,12 @@ surface DatabaseResolution {
 
     @guarantee ResolutionNeedsADatabaseToAnswer
         -- A name resolves only while this node holds a database behind it ready to answer.
-        -- Of any other held name a caller sees nothing at all: not the name, not that it exists.
-        -- It therefore cannot tell one from a name this node never held.
+        -- Of a name this node declines to run, or is releasing on instruction, a caller sees nothing at all: not the name, not that it exists.
+        -- It therefore cannot tell either from a name this node never held, and needs no more: nothing is coming, and the answer is to ask elsewhere.
+
+    @guarantee CallerLearnsWhetherToAskAgain
+        -- A name this node is opening a database for is answered as one to ask about again, so a caller waits rather than concluding the database is gone.
+        -- A name whose recovery ended is answered as one this node will not serve, which is what an operator has to act on and a caller cannot otherwise learn.
 }
 
 surface Membership {
