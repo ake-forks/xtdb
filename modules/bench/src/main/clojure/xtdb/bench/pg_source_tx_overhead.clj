@@ -9,7 +9,10 @@
    `pg-ingest-batch-N` is Postgres alone; `xt-drain-batch-N` is the source alone, and dividing
    it by `doc-count / batch-size` is the per-transaction cost the benchmark is named for.
 
-   See modules/bench/README.adoc for what a run needs and what it takes over in Postgres.
+   Both of the source database's logs go through Kafka, so the drain measures what a deployment
+   would pay: every mirrored transaction is a round trip to the broker on the replica log.
+
+   See modules/bench/README.adoc for what a run needs, and what it takes over in Postgres and Kafka.
 
    Run: ./gradlew pg-source-tx-overhead -PdocCount=100000 [-PbatchSizes=1000,1] [-Pyourkit]"
   (:require [clojure.string :as s]
@@ -37,12 +40,27 @@
 (def ^:private drain-poll-ms 5)
 (def ^:private drain-timeout-ms (* 10 60 1000))
 
-(defn- ->names [^long batch-size]
+;; the alias the node config registers the broker under, shared with `remotes` - see
+;; modules/bench/config/pg-source.yaml
+(def ^:private kafka-cluster "kafka")
+
+;; Kafka auto-creates these, and a topic that survived the run would be replayed by the next one,
+;; so every run gets its own. They are left behind - `docker compose down -v kafka` clears them.
+(defn- ->topic-prefix [] (str "xtdb-bench-pg-" (subs (str (random-uuid)) 0 8)))
+
+(defn- ->names [topic-prefix ^long batch-size]
   {:db (str "bench_pg_" batch-size)
    :table (str "batched_" batch-size)
    :marker (str "marker_" batch-size)
    :slot (str "xtdb_bench_pg_" batch-size)
-   :publication (str "xtdb_bench_pg_" batch-size)})
+   :publication (str "xtdb_bench_pg_" batch-size)
+   :topic (str topic-prefix "-" batch-size)
+
+   ;; the node's own log is per-batch-size too, because it carries the ATTACH records. Shared, the
+   ;; batch-1 node would replay every earlier batch size's ATTACH, re-open those databases against
+   ;; a storage directory the cleanup stage has deleted, and run their sources alongside the one
+   ;; being measured
+   :node-topic (str topic-prefix "-" batch-size "-node")})
 
 ;; --- postgres ---
 
@@ -94,28 +112,32 @@
 
 ;; --- node ---
 
-(defn- ->node-config [config-file ^Path node-dir]
-  ;; the config file carries the `pg` remote and nothing else; log and storage have to be local
-  ;; and per-batch-size, because the source resumes from a token that has to survive the restart
+(defn- ->node-config [config-file ^Path node-dir node-topic]
+  ;; the config file carries the `pg` remote and the `kafka` cluster; the logs are set here because
+  ;; they have to be per-run, and storage because the restart the drain depends on needs it durable
   (doto (xtn/->config (or config-file
-                          (throw (ex-info "pg-source-tx-overhead needs --config-file to register the `pg` remote" {}))))
-    (xtn/apply-config! :log [:local {:path (.resolve node-dir "log")}])
+                          (throw (ex-info "pg-source-tx-overhead needs --config-file for the `pg` remote and the `kafka` cluster" {}))))
+    (xtn/apply-config! :log [:kafka {:cluster kafka-cluster, :topic node-topic}])
     (xtn/apply-config! :storage [:local {:path (.resolve node-dir "objects")}])))
 
-(defn- attach-source-db! [node ^Path node-dir {:keys [db slot publication]} indexer]
+(defn- attach-source-db! [node ^Path node-dir {:keys [db slot publication topic]} indexer]
   (with-open [^Connection conn (jdbc/get-connection node)]
+    ;; one `topic` gives both logs - the replica log defaults to `<topic>-replica`, and it is the
+    ;; one every mirrored transaction goes through
     (execute! conn (format "ATTACH DATABASE %s WITH $$
 storage: !Local
   path: %s
-log: !Local
-  path: %s
+log: !Kafka
+  cluster: %s
+  topic: %s
 externalSource: !Postgres
   remote: pg
   slotName: %s
   publicationName: %s%s
 $$"
                            db
-                           (.resolve node-dir "src-objects") (.resolve node-dir "src-log")
+                           (.resolve node-dir "src-objects")
+                           kafka-cluster topic
                            slot publication
                            (if (s/blank? indexer) "" (str "\n  indexer: " indexer))))))
 
@@ -144,8 +166,8 @@ $$"
 
         :else (do (Thread/sleep (long drain-poll-ms)) (recur))))))
 
-(defn- with-node [config-file ^Path node-dir f]
-  (util/with-open [node (xtn/start-node (->node-config config-file node-dir))]
+(defn- with-node [config-file ^Path node-dir node-topic f]
+  (util/with-open [node (xtn/start-node (->node-config config-file node-dir node-topic))]
     (f node)))
 
 ;; --- reporting ---
@@ -164,8 +186,8 @@ $$"
 
 ;; --- tasks ---
 
-(defn- batch-size-tasks [{:keys [pg-url config-file indexer ^long doc-count]} ^long batch-size]
-  (let [names (->names batch-size)
+(defn- batch-size-tasks [{:keys [pg-url config-file indexer topic-prefix ^long doc-count]} ^long batch-size]
+  (let [names (->names topic-prefix batch-size)
         !node-dir (delay (util/tmp-dir (str "xtdb-bench-pg-" batch-size)))]
     [{:t :call, :stage (keyword (str "setup-pg-batch-" batch-size)), :setup? true
       :f (fn [_] (setup-pg! pg-url names))}
@@ -179,7 +201,7 @@ $$"
      {:t :call, :stage (keyword (str "prime-batch-" batch-size)), :setup? true
       :f (fn [_]
            (write-marker! pg-url names snapshotted-id)
-           (with-node config-file @!node-dir
+           (with-node config-file @!node-dir (:node-topic names)
              (fn [node]
                (attach-source-db! node @!node-dir names indexer)
                (await-marker! node names snapshotted-id)
@@ -194,7 +216,7 @@ $$"
      {:t :call, :stage (keyword (str "xt-drain-batch-" batch-size))
       :f (fn [_]
            (let [start-ms (System/currentTimeMillis)]
-             (with-node config-file @!node-dir
+             (with-node config-file @!node-dir (:node-topic names)
                (fn [node]
                  (let [open-ms (- (System/currentTimeMillis) start-ms)]
                    (await-marker! node names drained-id)
@@ -227,15 +249,17 @@ $$"
                        pg-url default-pg-url, source-indexer default-indexer}}]
   (log/info {:doc-count doc-count, :batch-sizes batch-sizes})
 
-  (let [opts {:pg-url pg-url, :config-file config-file
+  (let [topic-prefix (->topic-prefix)
+        opts {:pg-url pg-url, :config-file config-file, :topic-prefix topic-prefix
               :indexer source-indexer, :doc-count doc-count}]
     {:title "Postgres source tx overhead"
      :benchmark-type :pg-source-tx-overhead
      :seed seed
      ;; the indexer goes in the parameters because it is what differs between a run against an
-     ;; older node and one against this tree, and the two runs get compared
+     ;; older node and one against this tree, and the two runs get compared; the topic prefix so
+     ;; that a run's Kafka topics can be found afterwards
      :parameters {:doc-count doc-count, :batch-sizes (sort > batch-sizes)
-                  :source-indexer source-indexer}
+                  :source-indexer source-indexer, :topic-prefix topic-prefix}
      :tasks (into [] (mapcat #(batch-size-tasks opts %)) (sort > batch-sizes))}))
 
 (defmethod b/->benchmark :pg-source-tx-overhead [_ opts]

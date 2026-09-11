@@ -3,8 +3,14 @@
 # attached source database can reference it via `remote: pg`.
 # This and the bench's own --pg-url have to name the same server - the source reads the
 # upstream from here, the bench's writes go through the flag.
-# The remote is all this file is for: the bench overrides log and storage with a local
-# per-batch-size directory, because its measurement restarts the node.
+# The `kafka` cluster carries both of the attached database's logs, so the drain pays a broker
+# round trip per mirrored transaction rather than a local fsync - `docker compose up -d kafka`.
+# Aliases and topics are all this file is for: the bench sets the logs itself, because their topics
+# have to be per-run, and storage because its measurement restarts the node.
+logClusters:
+  kafka: !Kafka
+    bootstrapServers: localhost:9092
+
 remotes:
   pg: !Postgres
     hostname: localhost

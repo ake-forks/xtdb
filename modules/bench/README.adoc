@@ -27,7 +27,7 @@ The node config (registering the docker-compose broker as the `kafkaCluster` rem
 On the benchmark cluster, run it via the 'Nightly Benchmark Kafka Source' workflow dispatch (or `./cloud/run-bench.sh azure kafka-source`).
 
 Postgres source::
-`docker-compose up -d postgres`, then `./gradlew pg-source-tx-overhead -PdocCount=100000 -PbatchSizes=1000,100,10,1`
+`docker compose up -d postgres kafka`, then `./gradlew pg-source-tx-overhead -PdocCount=100000 -PbatchSizes=1000,100,10,1`
 +
 The same transaction-size sweep as IngestTsOverhead, but through CDC, with the writer and the mirror separated in time so that neither measurement contends with the other.
 Per batch size it attaches a source database against the empty table, closes the node, writes `docCount` rows into Postgres as transactions of `batchSize` while nothing is consuming, then reopens the node and times the source draining the backlog off the replication slot.
@@ -36,10 +36,13 @@ So `pg-ingest-batch-N` is Postgres alone and `xt-drain-batch-N` is the source al
 Completion is a marker row written after the batch, found by point query: the source applies transactions in LSN order, so the marker arriving means the whole backlog has.
 Batch sizes run one at a time, each with its own table, publication, slot, attached database and node directory, because a backlog is per-slot and there is no controlling which slot drains first.
 
-The node config (registering the docker-compose Postgres as the `pg` remote) defaults to `modules/bench/config/pg-source.yaml` - override with `-PconfigFile=...`, keeping it in step with `-PpgUrl`, which is where the benchmark's own writes go.
-The benchmark opens and closes its own nodes, overriding that config's log and storage with a per-batch-size local directory - the source resumes from a token that has to survive the restart.
+Both of the attached database's logs go through Kafka, so a mirrored transaction costs a broker round trip on the replica log rather than a local fsync - which is what a deployment pays, and what a local log hides behind its own `fsync`.
+
+The node config (the docker-compose Postgres as the `pg` remote and the broker as the `kafka` cluster) defaults to `modules/bench/config/pg-source.yaml` - override with `-PconfigFile=...`, keeping it in step with `-PpgUrl`, which is where the benchmark's own writes go.
+The benchmark opens and closes its own nodes, setting the logs itself because their topics have to be per-run, and storage to a per-batch-size local directory - the source resumes from a token that has to survive the restart.
 `-PsourceIndexer` sets the attached source's `indexer:`; pass it empty to attach against a node predating that key.
 Each run takes over the `batched_*` and `marker_*` tables and the `xtdb_bench_pg_*` publications and slots in that database, dropping and recreating them before it starts.
+Its Kafka topics are named for the run (the prefix is in the benchmark's `parameters`) and are left behind - `docker compose down -v kafka` clears them.
 
 NOTE: between the write and the drain, WAL accumulates on a slot with nothing consuming it - a few tens of MB at `docCount=100000`, but scale that with care, since a stalled slot is the standard way to fill a Postgres disk.
 
