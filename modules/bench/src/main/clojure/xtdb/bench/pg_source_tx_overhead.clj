@@ -30,8 +30,9 @@
 
 ;; the source applies transactions in LSN order, so the whole backlog has arrived once the row
 ;; written after it has
-(def ^:private primed-id 1)
-(def ^:private drained-id 2)
+(def ^:private snapshotted-id 1)
+(def ^:private streamed-id 2)
+(def ^:private drained-id 3)
 
 (def ^:private drain-poll-ms 5)
 (def ^:private drain-timeout-ms (* 10 60 1000))
@@ -170,15 +171,20 @@ $$"
       :f (fn [_] (setup-pg! pg-url names))}
 
      ;; attaching against the empty table leaves a snapshot-complete token behind, which is what
-     ;; the drain resumes from. Its arrival is only observable through a streamed row, so the
-     ;; primer doubles as proof the snapshot finished before we take the node away
+     ;; the drain resumes from. It is written between the last snapshot batch and the stream
+     ;; opening, so it takes two markers to know it is durable rather than nearly so: marker 1
+     ;; predates the slot and comes back through the snapshot, proving only that the slot exists;
+     ;; marker 2 is written after that, so it is past the slot's consistent point, has to be
+     ;; streamed, and its arrival puts the token behind us
      {:t :call, :stage (keyword (str "prime-batch-" batch-size)), :setup? true
       :f (fn [_]
+           (write-marker! pg-url names snapshotted-id)
            (with-node config-file @!node-dir
              (fn [node]
                (attach-source-db! node @!node-dir names indexer)
-               (write-marker! pg-url names primed-id)
-               (await-marker! node names primed-id))))}
+               (await-marker! node names snapshotted-id)
+               (write-marker! pg-url names streamed-id)
+               (await-marker! node names streamed-id))))}
 
      {:t :call, :stage (keyword (str "pg-ingest-batch-" batch-size))
       :f (fn [_]

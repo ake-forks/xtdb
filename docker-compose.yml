@@ -66,7 +66,12 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
-    command: ["postgres", "-c", "wal_level=logical"]
+    # wal_sender_timeout: the source sends a standby status update only when its confirmable LSN
+    # advances, and once a block exists that LSN comes from the last flushed block's token - so
+    # between two flushes it sends nothing at all, and at the 60s default the server kills the
+    # walsender mid-stream. Disabled rather than raised: any finite value is a bet on how long a
+    # flush gap can get, and a dev container has nothing to gain from reaping dead clients.
+    command: ["postgres", "-c", "wal_level=logical", "-c", "wal_sender_timeout=0"]
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
