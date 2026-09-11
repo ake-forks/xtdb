@@ -1,10 +1,13 @@
 (ns xtdb.bench.pg-source-tx-overhead
-  "The IngestTsOverhead sweep run through CDC: writes `doc-count` rows into Postgres at each
-   batch size and measures how long they take to reach the XTDB database mirroring it.
+  "The IngestTsOverhead sweep run through CDC, with the writer and the mirror separated in time
+   so neither measurement contends with the other.
 
-   `pg-ingest-batch-N` is the write into Postgres and `xt-mirror-batch-N` is what was still
-   outstanding when that write stopped; per-transaction latency comes from the source's own
-   `commit_lag_seconds` summary, logged at the end of each mirror stage.
+   Per batch size: attach a source database against the empty table, close the node, write
+   `doc-count` rows into Postgres as transactions of `batch-size` while nothing is consuming,
+   then reopen the node and time the source draining the backlog.
+
+   `pg-ingest-batch-N` is Postgres alone; `xt-drain-batch-N` is the source alone, and dividing
+   it by `doc-count / batch-size` is the per-transaction cost the benchmark is named for.
 
    See modules/bench/README.adoc for what a run needs and what it takes over in Postgres.
 
@@ -13,22 +16,34 @@
             [clojure.tools.logging :as log]
             [next.jdbc :as jdbc]
             [xtdb.api :as xt]
-            [xtdb.bench :as b])
-  (:import [io.micrometer.core.instrument DistributionSummary Meter MeterRegistry]
+            [xtdb.bench :as b]
+            [xtdb.node :as xtn]
+            [xtdb.util :as util])
+  (:import [java.nio.file Path]
            [java.sql Connection Statement]))
-
-(def ^:private db-name "bench_pg_src")
-(def ^:private slot-name "xtdb_bench_pg_source")
-(def ^:private publication-name "xtdb_bench_pg_source")
-(def ^:private sentinel-table "sentinel")
 
 (def ^:private default-pg-url "jdbc:postgresql://localhost:5433/postgres?user=postgres&password=postgres")
 
-;; only ever waited out after the writer has stopped, so this catches a stalled source
-;; rather than budgeting for a slow one
-(def ^:private mirror-timeout-ms (* 10 60 1000))
+;; the `indexer` key arrived with 5f673a873 and the config parser rejects unknown keys, so an
+;; older node needs this empty rather than defaulted
+(def ^:private default-indexer "!DirectMirror {}")
 
-(defn- table-name [^long batch-size] (str "batched_" batch-size))
+;; the source applies transactions in LSN order, so the whole backlog has arrived once the row
+;; written after it has
+(def ^:private primed-id 1)
+(def ^:private drained-id 2)
+
+(def ^:private drain-poll-ms 5)
+(def ^:private drain-timeout-ms (* 10 60 1000))
+
+(defn- ->names [^long batch-size]
+  {:db (str "bench_pg_" batch-size)
+   :table (str "batched_" batch-size)
+   :marker (str "marker_" batch-size)
+   :slot (str "xtdb_bench_pg_" batch-size)
+   :publication (str "xtdb_bench_pg_" batch-size)})
+
+;; --- postgres ---
 
 (defn- pg-conn ^Connection [pg-url]
   (jdbc/get-connection {:jdbcUrl pg-url}))
@@ -38,112 +53,151 @@
     (doseq [^String sql sqls]
       (.execute stmt sql))))
 
-(defn- setup-pg! [pg-url batch-sizes]
-  (let [tables (conj (mapv table-name (sort > batch-sizes)) sentinel-table)]
-    (with-open [conn (pg-conn pg-url)]
-      (apply execute! conn
-             (concat [(format "DROP PUBLICATION IF EXISTS %s" publication-name)
-
-                      ;; a slot outlives the node that created it, so the previous run's is still
-                      ;; holding WAL - reclaim it here, where nothing has it open
-                      (format "SELECT pg_drop_replication_slot('%s') FROM pg_replication_slots WHERE slot_name = '%s'"
-                              slot-name slot-name)]
-
-                     (mapcat (fn [table]
-                               [(format "DROP TABLE IF EXISTS %s" table)
-                                (format "CREATE TABLE %s (_id BIGINT PRIMARY KEY)" table)])
-                             tables)
-
-                     [(format "CREATE PUBLICATION %s FOR TABLE %s" publication-name (s/join ", " tables))])))))
-
-(defn- attach-source-db! [node]
-  (with-open [^Connection conn (jdbc/get-connection node)]
-    (execute! conn (format "ATTACH DATABASE %s WITH $$
-externalSource: !Postgres
-  remote: pg
-  slotName: %s
-  publicationName: %s
-  indexer: !DirectMirror {}
-$$"
-                           db-name slot-name publication-name))))
-
-(defn- xt-row-count [node table]
-  (or (try
-        ;; the table only exists once the source has mirrored its first row
-        (:n (first (xt/q node [(format "SELECT COUNT(*) n FROM %s.public.%s" db-name table)])))
-        (catch Exception _ nil))
-      0))
-
-(defn- await-rows! [node table ^long expected]
-  (let [start-ms (System/currentTimeMillis)
-        deadline-ms (+ start-ms (long mirror-timeout-ms))]
-    (loop []
-      (when (Thread/interrupted) (throw (InterruptedException.)))
-
-      (let [n (long (xt-row-count node table))
-            now-ms (System/currentTimeMillis)]
-        (cond
-          (>= n expected) (log/infof "%s: %,d rows mirrored, %.3fs behind the last write"
-                                     table n (/ (- now-ms start-ms) 1000.0))
-
-          (> now-ms deadline-ms) (throw (ex-info "timed out waiting for rows to reach XT"
-                                                 {:table table, :expected expected, :actual n}))
-
-          :else (do (Thread/sleep 200) (recur)))))))
-
-(defn- await-streaming! [node pg-url]
-  ;; rows committed before the slot goes live arrive in the source's initial snapshot instead of
-  ;; its stream, and the snapshot neither records a commit lag nor is what this measures
+(defn- setup-pg! [pg-url {:keys [table marker slot publication]}]
   (with-open [conn (pg-conn pg-url)]
-    (execute! conn (format "INSERT INTO %s (_id) VALUES (0)" sentinel-table)))
-  (await-rows! node sentinel-table 1))
+    (apply execute! conn
+           (concat [(format "DROP PUBLICATION IF EXISTS %s" publication)
 
-(defn- pg-ingest! [conn table ^long doc-count ^long per-batch]
-  (with-open [ps (jdbc/prepare conn [(format "INSERT INTO %s (_id) VALUES (?)" table)])]
+                    ;; a slot outlives the node that created it, so the previous run's is still
+                    ;; holding WAL - reclaim it here, where nothing has it open
+                    (format "SELECT pg_drop_replication_slot('%s') FROM pg_replication_slots WHERE slot_name = '%s'"
+                            slot slot)]
+
+                   (mapcat (fn [t]
+                             [(format "DROP TABLE IF EXISTS %s" t)
+                              (format "CREATE TABLE %s (_id BIGINT PRIMARY KEY)" t)])
+                           [table marker])
+
+                   [(format "CREATE PUBLICATION %s FOR TABLE %s, %s" publication table marker)]))))
+
+(defn- write-marker! [pg-url {:keys [marker]} ^long id]
+  (with-open [conn (pg-conn pg-url)]
+    (execute! conn (format "INSERT INTO %s (_id) VALUES (%d)" marker id))))
+
+(defn- pg-ingest! [pg-url {:keys [table]} ^long doc-count ^long per-batch]
+  (with-open [conn (pg-conn pg-url)
+              ps (jdbc/prepare conn [(format "INSERT INTO %s (_id) VALUES (?)" table)])]
     (doseq [batch (partition-all per-batch (range doc-count))]
       (let [first-idx (long (first batch))]
-        (when (zero? (rem first-idx 1000))
-          (log/trace :done first-idx)))
+        (when (zero? (rem first-idx 10000))
+          (log/tracef "%s: %,d written" table first-idx)))
 
       (when (Thread/interrupted) (throw (InterruptedException.)))
 
       (jdbc/with-transaction [_ conn]
-        (jdbc/execute-batch! ps (mapv vector batch)))))
+        (jdbc/execute-batch! ps (mapv vector batch))))
 
-  (let [{actual :doc_count} (jdbc/execute-one! conn [(format "SELECT COUNT(*) doc_count FROM %s" table)])]
-    (assert (= actual doc-count)
-            (format "failed for %s: expected: %d, got: %d" table doc-count actual))))
+    (let [{actual :doc_count} (jdbc/execute-one! conn [(format "SELECT COUNT(*) doc_count FROM %s" table)])]
+      (assert (= actual doc-count)
+              (format "failed for %s: expected: %d, got: %d" table doc-count actual)))))
 
-(defn- commit-lag-totals []
-  (when-let [^MeterRegistry reg b/*registry*]
-    (when-let [^DistributionSummary summary (->> (.getMeters reg)
-                                                 (filter #(= "xtdb.postgres_source.commit_lag_seconds"
-                                                             (.getName (.getId ^Meter %))))
-                                                 first)]
-      {:count (.count summary), :total-seconds (.totalAmount summary)})))
+;; --- node ---
 
-(defn- log-commit-lag [before after]
-  (when (and before after)
-    (let [txs (- (long (:count after)) (long (:count before)))
-          total-seconds (- (double (:total-seconds after)) (double (:total-seconds before)))]
-      (when (pos? txs)
-        (log/infof "commit lag: %,d txs, mean %.1fms" txs (/ (* 1000.0 total-seconds) txs))))))
+(defn- ->node-config [config-file ^Path node-dir]
+  ;; the config file carries the `pg` remote and nothing else; log and storage have to be local
+  ;; and per-batch-size, because the source resumes from a token that has to survive the restart
+  (doto (xtn/->config (or config-file
+                          (throw (ex-info "pg-source-tx-overhead needs --config-file to register the `pg` remote" {}))))
+    (xtn/apply-config! :log [:local {:path (.resolve node-dir "log")}])
+    (xtn/apply-config! :storage [:local {:path (.resolve node-dir "objects")}])))
 
-(defn- batch-size-tasks [pg-url ^long doc-count ^long batch-size]
-  (let [table (table-name batch-size)
-        !lag-before (atom nil)]
-    [{:t :call
-      :stage (keyword (str "pg-ingest-batch-" batch-size))
+(defn- attach-source-db! [node ^Path node-dir {:keys [db slot publication]} indexer]
+  (with-open [^Connection conn (jdbc/get-connection node)]
+    (execute! conn (format "ATTACH DATABASE %s WITH $$
+storage: !Local
+  path: %s
+log: !Local
+  path: %s
+externalSource: !Postgres
+  remote: pg
+  slotName: %s
+  publicationName: %s%s
+$$"
+                           db
+                           (.resolve node-dir "src-objects") (.resolve node-dir "src-log")
+                           slot publication
+                           (if (s/blank? indexer) "" (str "\n  indexer: " indexer))))))
+
+(defn- marker-arrived? [node {:keys [db marker]} ^long id !last-error]
+  (try
+    ;; the table only exists once the source has mirrored its first row
+    (boolean (seq (xt/q node [(format "SELECT _id FROM %s.public.%s WHERE _id = %d" db marker id)])))
+    (catch Exception e
+      (reset! !last-error (ex-message e))
+      false)))
+
+(defn- await-marker! [node names ^long id]
+  (let [deadline-ms (+ (System/currentTimeMillis) (long drain-timeout-ms))
+        ;; a database that failed to attach queries exactly like one that hasn't caught up yet, so
+        ;; carry the last error into the timeout - otherwise a rejected ATTACH reads as a slow drain
+        !last-error (atom nil)]
+    (loop []
+      (when (Thread/interrupted) (throw (InterruptedException.)))
+
+      (cond
+        (marker-arrived? node names id !last-error) nil
+
+        (> (System/currentTimeMillis) deadline-ms)
+        (throw (ex-info "timed out waiting for the marker to reach XT"
+                        {:names names, :marker-id id, :last-error @!last-error}))
+
+        :else (do (Thread/sleep (long drain-poll-ms)) (recur))))))
+
+(defn- with-node [config-file ^Path node-dir f]
+  (util/with-open [node (xtn/start-node (->node-config config-file node-dir))]
+    (f node)))
+
+;; --- reporting ---
+
+(defn- log-drain [{:keys [table]} doc-count batch-size open-ms drain-ms]
+  (let [doc-count (long doc-count)
+        txs (quot doc-count (long batch-size))
+        secs (/ (long drain-ms) 1000.0)]
+    (log/infof "%s: drained %,d txs (%,d rows) in %.3fs - %,.0f tx/sec, %,.0f rows/sec (node open %,dms)"
+               table txs doc-count secs (/ txs secs) (/ doc-count secs) open-ms)))
+
+(defn- verify-rows! [node {:keys [db table]} ^long doc-count]
+  (let [{:keys [n]} (first (xt/q node [(format "SELECT COUNT(*) n FROM %s.public.%s" db table)]))]
+    (when-not (= doc-count n)
+      (throw (ex-info "row count mismatch" {:table table, :expected doc-count, :actual n})))))
+
+;; --- tasks ---
+
+(defn- batch-size-tasks [{:keys [pg-url config-file indexer ^long doc-count]} ^long batch-size]
+  (let [names (->names batch-size)
+        !node-dir (delay (util/tmp-dir (str "xtdb-bench-pg-" batch-size)))]
+    [{:t :call, :stage (keyword (str "setup-pg-batch-" batch-size)), :setup? true
+      :f (fn [_] (setup-pg! pg-url names))}
+
+     ;; attaching against the empty table leaves a snapshot-complete token behind, which is what
+     ;; the drain resumes from. Its arrival is only observable through a streamed row, so the
+     ;; primer doubles as proof the snapshot finished before we take the node away
+     {:t :call, :stage (keyword (str "prime-batch-" batch-size)), :setup? true
       :f (fn [_]
-           (reset! !lag-before (commit-lag-totals))
-           (with-open [conn (pg-conn pg-url)]
-             (pg-ingest! conn table doc-count batch-size)))}
+           (with-node config-file @!node-dir
+             (fn [node]
+               (attach-source-db! node @!node-dir names indexer)
+               (write-marker! pg-url names primed-id)
+               (await-marker! node names primed-id))))}
 
-     {:t :call
-      :stage (keyword (str "xt-mirror-batch-" batch-size))
-      :f (fn [{:keys [node]}]
-           (await-rows! node table doc-count)
-           (log-commit-lag @!lag-before (commit-lag-totals)))}]))
+     {:t :call, :stage (keyword (str "pg-ingest-batch-" batch-size))
+      :f (fn [_]
+           (pg-ingest! pg-url names doc-count batch-size)
+           (write-marker! pg-url names drained-id))}
+
+     {:t :call, :stage (keyword (str "xt-drain-batch-" batch-size))
+      :f (fn [_]
+           (let [start-ms (System/currentTimeMillis)]
+             (with-node config-file @!node-dir
+               (fn [node]
+                 (let [open-ms (- (System/currentTimeMillis) start-ms)]
+                   (await-marker! node names drained-id)
+                   (log-drain names doc-count batch-size open-ms
+                              (- (System/currentTimeMillis) start-ms open-ms))
+                   (verify-rows! node names doc-count))))))}
+
+     {:t :call, :stage (keyword (str "cleanup-batch-" batch-size)), :setup? true
+      :f (fn [_] (util/delete-dir @!node-dir))}]))
 
 (defmethod b/cli-flags :pg-source-tx-overhead [_]
   [["-dc" "--doc-count DOCUMENT_COUNT" "Number of documents to ingest"
@@ -157,39 +211,35 @@ $$"
    [nil "--pg-url JDBC_URL" "Postgres to write into - has to be the server the node config's `pg` remote names"
     :default default-pg-url]
 
+   [nil "--source-indexer INDEXER" "`indexer:` for the attached source - empty to omit it, for nodes predating the key"
+    :default default-indexer]
+
    ["-h" "--help"]])
 
-(defn benchmark [{:keys [seed doc-count batch-sizes pg-url]
-                  :or {seed 0, doc-count 100000, batch-sizes #{1000 100 10 1}, pg-url default-pg-url}}]
+(defn benchmark [{:keys [seed doc-count batch-sizes pg-url source-indexer config-file]
+                  :or {seed 0, doc-count 100000, batch-sizes #{1000 100 10 1}
+                       pg-url default-pg-url, source-indexer default-indexer}}]
   (log/info {:doc-count doc-count, :batch-sizes batch-sizes})
 
-  {:title "Postgres source tx overhead"
-   :benchmark-type :pg-source-tx-overhead
-   :seed seed
-   :parameters {:doc-count doc-count, :batch-sizes (sort > batch-sizes)}
-   :tasks (into [{:t :call, :stage :setup-pg, :setup? true
-                  :f (fn [_] (setup-pg! pg-url batch-sizes))}
-
-                 {:t :call, :stage :attach, :setup? true
-                  :f (fn [{:keys [node]}] (attach-source-db! node))}
-
-                 {:t :call, :stage :await-streaming, :setup? true
-                  :f (fn [{:keys [node]}] (await-streaming! node pg-url))}]
-
-                (mapcat #(batch-size-tasks pg-url doc-count %) (sort > batch-sizes)))})
+  (let [opts {:pg-url pg-url, :config-file config-file
+              :indexer source-indexer, :doc-count doc-count}]
+    {:title "Postgres source tx overhead"
+     :benchmark-type :pg-source-tx-overhead
+     :seed seed
+     ;; the indexer goes in the parameters because it is what differs between a run against an
+     ;; older node and one against this tree, and the two runs get compared
+     :parameters {:doc-count doc-count, :batch-sizes (sort > batch-sizes)
+                  :source-indexer source-indexer}
+     :tasks (into [] (mapcat #(batch-size-tasks opts %)) (sort > batch-sizes))}))
 
 (defmethod b/->benchmark :pg-source-tx-overhead [_ opts]
   (benchmark opts))
 
 (comment
   ;; needs `docker-compose up postgres`
-  (require '[clojure.java.io :as io]
-           '[xtdb.node :as xtn]
-           '[xtdb.util :as util])
+  (require '[clojure.java.io :as io])
 
-  ;; a run owns its node start to finish: the slot setup-pg! reclaims is still held by the
-  ;; source of any node that is up, and the database it attaches is already attached there
-  (with-open [node (xtn/start-node (io/file "modules/bench/config/pg-source.yaml"))]
-    (binding [b/*registry* (.getMeterRegistry (util/node-base node))]
-      ((b/compile-benchmark (benchmark {:doc-count 10000, :batch-sizes #{1000 1}}))
-       node))))
+  ;; every stage opens and closes its own node, so there is nothing to hand a running one to
+  ((b/compile-benchmark (benchmark {:doc-count 10000, :batch-sizes #{1000 1}
+                                    :config-file (io/file "modules/bench/config/pg-source.yaml")}))
+   nil))

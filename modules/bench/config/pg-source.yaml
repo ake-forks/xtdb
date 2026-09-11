@@ -3,8 +3,8 @@
 # attached source database can reference it via `remote: pg`.
 # This and the bench's own --pg-url have to name the same server - the source reads the
 # upstream from here, the bench's writes go through the flag.
-# The node's own log/storage are left as the in-memory defaults - the attached source
-# database is what the bench measures.
+# The remote is all this file is for: the bench overrides log and storage with a local
+# per-batch-size directory, because its measurement restarts the node.
 remotes:
   pg: !Postgres
     hostname: localhost
