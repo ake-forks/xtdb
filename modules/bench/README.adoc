@@ -26,6 +26,14 @@ Pre-loads a Kafka topic with small JSON records, attaches a `!KafkaConnect` sour
 The node config (registering the docker-compose broker as the `kafkaCluster` remote, matching the cloud bench node configs) defaults to `modules/bench/config/kafka-source.yaml` - override with `-PconfigFile=...`.
 On the benchmark cluster, run it via the 'Nightly Benchmark Kafka Source' workflow dispatch (or `./cloud/run-bench.sh azure kafka-source`).
 
+Postgres source::
+`docker-compose up -d postgres`, then `./gradlew pg-source-tx-overhead -PdocCount=100000 -PbatchSizes=1000,100,10,1`
++
+The same transaction-size sweep as IngestTsOverhead, but through CDC: each batch size writes `docCount` rows into Postgres, and a `!Postgres` source mirrors them into an attached XTDB database.
+`pg-ingest-batch-N` is the write into Postgres and `xt-mirror-batch-N` is how far behind the mirror still was when that write stopped; per-transaction latency comes from the source's own `commit_lag_seconds` summary, logged at the end of each mirror stage.
+The node config (registering the docker-compose Postgres as the `pg` remote) defaults to `modules/bench/config/pg-source.yaml` - override with `-PconfigFile=...`, keeping it in step with `-PpgUrl`, which is where the benchmark's own writes go.
+Each run takes over the `batched_*` and `sentinel` tables and the `xtdb_bench_pg_source` publication and slot in that database, dropping and recreating them before it starts.
+
 
 Food Prices::
 `./gradlew food-prices -Psize=small`

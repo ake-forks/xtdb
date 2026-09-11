@@ -871,7 +871,12 @@ createBench("patch", mapOf("docCount" to "--doc-count", "patchCount" to "--patch
 
 createBench("ingestTxOverhead", mapOf("docCount" to "--doc-count", "batchSizes" to "--batch-sizes"))
 
-createBench("pg-source-tx-overhead", mapOf("docCount" to "--doc-count", "batchSizes" to "--batch-sizes"))
+createBench(
+    "pg-source-tx-overhead",
+    mapOf("docCount" to "--doc-count", "batchSizes" to "--batch-sizes", "pgUrl" to "--pg-url"),
+    // the source's `remote: pg` needs a remote registered on the node, which only config files support
+    defaultArgs = mapOf("--config-file" to "modules/bench/config/pg-source.yaml")
+)
 
 createBench("clickbench", mapOf("limit" to "--limit", "size" to "--size"))
 

@@ -16,6 +16,7 @@ dependencies {
     api(testFixtures(project(":")))
     api(project(":modules:xtdb-datasets"))
     api(project(":modules:xtdb-kafka"))
+    api(project(":modules:xtdb-postgres-source"))
     api(project(":modules:xtdb-aws"))
     api(project(":modules:xtdb-azure"))
     api(project(":modules:xtdb-google-cloud"))
