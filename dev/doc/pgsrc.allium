@@ -5,7 +5,8 @@
 --   Confirming is an instruction to discard, not a progress report, so the only
 --   question is which positions are safe to give.
 -- Includes: the positions tracked and their ordering; the confirmation rule;
---   the re-delivery skip; the effect of a failed import.
+--   the re-delivery skip; the effect of a failed import; the stream's teardown
+--   and the reopening that follows a connection failure.
 -- Excludes: XTDB's processing model (see db.allium); row and type mapping;
 --   TOAST and replica-identity constraints; slot and publication creation.
 --
@@ -121,18 +122,44 @@ contract ConfirmablePosition {
 entity PgSource {
     slot: PgSlot
 
-    -- Recovered, not chosen. Deliberately unordered against durable_lsn: it can
-    -- lead, being recovered from state a storage-only recovery would lose.
-    start_lsn: Integer
+    -- There is no stream before the first open, nor between a connection failure and the reopen that follows it.
+    stream: open | absent | failed
+
+    transitions stream {
+        absent -> open
+        absent -> failed
+        open -> absent
+        open -> failed
+        terminal: failed
+    }
 
     -- The furthest position the target holds, whether or not its storage has it.
-    -- Opens at start_lsn rather than at nothing, because recovery has already put
-    -- the target past it — see SourceOpensStream.
+    -- Opens at the resume position rather than at nothing, because recovery has already put the target past it — see SourceOpensStream.
+    -- It outlives the stream that advanced it, and is where the next one resumes.
     held_lsn: Integer
+
+    -- The furthest position the target has finished importing, so it trails held_lsn while submissions are in flight.
+    applied_lsn: Integer
 
     -- Advances on every record the upstream sends, so it can sit above the last
     -- commit and below the commit of a transaction still arriving.
-    received_lsn: Integer
+    received_lsn: Integer when stream = open
+
+    stream_opened_at: Timestamp when stream = open
+
+    -- Whether this stream delivered a transaction of its own.
+    stream_delivered: Boolean when stream = open
+
+    -- The run of attempts that neither delivered nor stayed up.
+    fruitless_attempts: Integer
+
+    -- When the next attempt is due; absent until a connection failure schedules one.
+    reopen_at: Timestamp?
+
+    in_flight: applied_lsn < held_lsn
+
+    -- Volatile on two counts: the backoff may elapse before the target settles what the lost stream submitted, or after it.
+    reopen_due: stream = absent and not in_flight and reopen_at <= now
 
     -- Everything the target holds is on the far side of an existing recovery point.
     all_held_durable: xtdb.durable_lsn != null and held_lsn <= xtdb.durable_lsn
@@ -162,24 +189,31 @@ entity PgSource {
     invariant HeldWithinReceived {
         held_lsn <= received_lsn
     }
+}
 
-    invariant StartWithinHeld {
-        -- The target does not give back what recovery handed it, so the WAL
-        -- below start_lsn stays unconfirmable until a block covers it.
-        start_lsn <= held_lsn
-    }
+---- Config
+
+config {
+    -- Fruitless attempts before the stream is torn down for good.
+    reconnect_max_attempts: Integer = 7
+
+    reconnect_base_delay: Duration = 1.second
+
+    -- The longest backoff: the base doubled reconnect_max_attempts - 1 times.
+    reconnect_healthy_stream: Duration = 64.seconds
 }
 
 ---- Rules
 
 rule SourceOpensStream {
-    -- The resume position comes from the target, not from the slot. The two are
-    -- recovered from different places and the slot's is normally the lower, so
-    -- nothing here licenses an inference about slot.confirmed_lsn.
+    -- At the first open the resume position is recovered, not chosen: deliberately unordered against durable_lsn, it can lead, being recovered from state a storage-only recovery would lose.
+    -- It comes from the target, not from the slot; the two are recovered from different places and the slot's is normally the lower, so nothing here licenses an inference about slot.confirmed_lsn.
+    -- A reopen resumes from held_lsn.
     when: StreamOpened(upstream, source, resume_lsn)
+    requires: source.stream = absent
 
     ensures:
-        source.start_lsn = resume_lsn
+        source.stream = open
 
         -- Not nothing-held: the transactions between the durable extent and
         -- resume_lsn exist only inside the target, so confirming over them would
@@ -188,24 +222,38 @@ rule SourceOpensStream {
         source.held_lsn = resume_lsn
 
         source.received_lsn = resume_lsn
+        source.stream_opened_at = now
+        source.stream_delivered = false
+        source.reopen_at = null
 }
 
 rule SourceReceivesTransaction {
     when: PgTransactionReceived(upstream, source, tx_lsn)
+    requires: source.stream = open
+
+    -- Skipped at or below held_lsn: per ResendsFromConfirmed the upstream may re-send what we already hold, and re-importing would record a second version of it.
+    -- At held_lsn exactly as well as below it, because a reopened stream starts at the position it asks for inclusively.
+    let is_new = tx_lsn > source.held_lsn
 
     ensures:
         source.received_lsn = tx_lsn
 
-        -- Skipped below start_lsn: per ResendsFromConfirmed the upstream may
-        -- re-send what we already hold, and re-importing would record a second
-        -- version of it.
-        if tx_lsn > source.start_lsn:
+        if is_new:
             SubmitToTarget(source, tx_lsn)
             source.held_lsn = tx_lsn
+            source.stream_delivered = true
+}
+
+rule TargetAppliesTransaction {
+    when: TargetImportApplied(target, source, tx_lsn)
+
+    ensures:
+        source.applied_lsn = tx_lsn
 }
 
 rule SourceReceivesKeepalive {
     when: PgKeepaliveReceived(upstream, source, upstream_lsn)
+    requires: source.stream = open
     requires: upstream_lsn > source.received_lsn
 
     ensures:
@@ -216,6 +264,7 @@ rule SourceConfirmsPosition {
     -- The position moves when the target flushes or the upstream reports
     -- progress, neither of which is a delivery.
     when: source: PgSource.has_unconfirmed
+    requires: source.stream = open
     requires: source.confirmable_lsn > source.slot.confirmed_lsn
 
     ensures:
@@ -225,17 +274,71 @@ rule SourceConfirmsPosition {
         -- A tracked lower bound on slot.confirmed_lsn is enough to skip a
         -- confirmation that would change nothing, and per
         -- IgnoresRetrogradeConfirmations a bound that is too low costs only the
-        -- redundant call. It MUST NOT be seeded from start_lsn, which is normally
-        -- the higher of the two.
+        -- redundant call. It MUST NOT be seeded from the resume position, which is
+        -- normally the higher of the two.
 }
 
 rule ImportFailureTearsDownStream {
-    -- Not confirmed, and not skipped: leaving the slot put makes the upstream
-    -- re-send, per ResendsFromConfirmed.
+    -- Not confirmed, and not skipped: leaving the slot put makes the upstream re-send, per ResendsFromConfirmed.
+    -- With or without a stream: the transactions a lost stream submitted are settled before the next one opens, so a failure they carried arrives while there is none.
     when: TargetImportFailed(target, source, error)
+    requires: source.stream != failed
+
+    let was_open = source.stream = open
 
     ensures:
+        source.stream = failed
+
+        if was_open:
+            source.received_lsn = null
+            source.stream_opened_at = null
+            source.stream_delivered = null
+
         StreamTornDown(source)
+}
+
+rule ConnectionFailureTearsDownStream {
+    -- The connection failed, whether it was streaming or still opening, so the position it was reading from is ours to ask for again.
+    when: StreamConnectionFailed(upstream, source)
+    requires: source.stream != failed
+
+    let was_open = source.stream = open
+
+    -- The count is a run of fruitless attempts, so a source that reconnects successfully every few hours never accumulates its way to the bound.
+    -- A stream that delivered a transaction worked, and so did one that stayed up longer than we would ever wait before retrying, which is what keeps a quiet upstream from being taken for a flapping one.
+    -- An attempt that never got a connection is neither.
+    let worked =
+        was_open
+        and (source.stream_delivered or now - source.stream_opened_at >= config.reconnect_healthy_stream)
+
+    let attempts = if worked: 1 else: source.fruitless_attempts + 1
+
+    ensures:
+        source.fruitless_attempts = attempts
+
+        if was_open:
+            source.received_lsn = null
+            source.stream_opened_at = null
+            source.stream_delivered = null
+
+        if attempts > config.reconnect_max_attempts:
+            source.stream = failed
+            StreamTornDown(source)
+        else:
+            source.stream = absent
+
+            -- Doubling from the base, jittered by up to half as much again.
+            source.reopen_at = now + with_jitter(config.reconnect_base_delay * pow(2, attempts - 1))
+}
+
+rule SourceReopensStream {
+    -- The stream reopens only from a state with nothing in flight.
+    -- A transaction the lost stream submitted and the target has not yet applied may still fail the import, and streaming on past it would take the confirmed position over a transaction the target never imported.
+    when: source: PgSource.reopen_due
+    requires: source.stream = absent
+
+    ensures:
+        StreamOpened(upstream: source.slot, source: source, resume_lsn: source.held_lsn)
 }
 
 ---- Invariants
@@ -266,6 +369,7 @@ surface UpstreamReplication {
         StreamOpened(upstream, source, resume_lsn)
         PgTransactionReceived(upstream, source, tx_lsn)
         PgKeepaliveReceived(upstream, source, upstream_lsn)
+        StreamConnectionFailed(upstream, source)
 
     contracts:
         demands UpstreamWalSemantics
@@ -299,6 +403,7 @@ surface TargetIngestion {
     context source: PgSource
 
     provides:
+        TargetImportApplied(target, source, tx_lsn)
         TargetImportFailed(target, source, error)
 
     contracts:
