@@ -6,10 +6,23 @@ import kotlinx.serialization.modules.polymorphic
 import org.apache.kafka.connect.sink.SinkRecord
 import xtdb.api.error.Unsupported
 import xtdb.api.tx.TxIndexer
+import xtdb.kafka.connectsrc.proto.KafkaConnectSourceToken
 import java.util.ServiceLoader
 import com.google.protobuf.Any as ProtoAny
 
 interface RecordIndexer : AutoCloseable {
+
+    /**
+     * Called at the start of each leader term, before any [indexRecords] in that term.
+     *
+     * The indexer outlives the term, so state belonging to the previous term — a partly-buffered batch, say —
+     * is discarded here, and anything the indexer keeps across terms is restored from [userToken].
+     *
+     * @param userToken the `user_token` of the last indexed transaction's [KafkaConnectSourceToken],
+     *   or null if no transaction has been indexed or that token carried none.
+     *   An indexer that keeps state across terms writes it there when it submits a transaction.
+     */
+    fun beginTerm(userToken: ByteArray?) = Unit
 
     suspend fun indexRecords(records: List<SinkRecord>, txIndexer: TxIndexer)
 

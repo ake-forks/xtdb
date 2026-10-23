@@ -3,8 +3,25 @@ package xtdb.kafka.connectsrc
 import clojure.lang.ILookup
 import clojure.lang.Keyword
 import io.micrometer.core.instrument.MeterRegistry
+import com.google.protobuf.ByteString
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.test.runTest
+import org.apache.kafka.connect.sink.SinkRecord
+import org.junit.jupiter.api.Assertions.assertNull
+import xtdb.api.TransactionResult
+import xtdb.api.tx.BlockDetails
+import xtdb.api.tx.ExternalSourceToken
+import xtdb.api.tx.OpenTx
+import xtdb.api.tx.TxIndexer
+import xtdb.kafka.connectsrc.proto.kafkaConnectSourceToken
+import java.util.concurrent.CopyOnWriteArrayList
 import org.apache.avro.Conversions
 import org.apache.avro.Schema as AvroSchema
 import org.apache.avro.generic.GenericData
@@ -126,6 +143,33 @@ class KafkaConnectSourceIntegrationTest {
         }
     }
 
+    private class TermRecordingIndexer : RecordIndexer {
+        val termTokens = CopyOnWriteArrayList<ByteArray?>()
+        override fun beginTerm(userToken: ByteArray?) { termTokens.add(userToken) }
+        override suspend fun indexRecords(records: List<SinkRecord>, txIndexer: TxIndexer) = Unit
+    }
+
+    private object UnusedTxIndexer : TxIndexer {
+        override val latestBlock: StateFlow<BlockDetails?> = MutableStateFlow(null)
+
+        override suspend fun executeTx(
+            externalSourceToken: ExternalSourceToken?, systemTime: Instant?, writer: suspend (OpenTx) -> TxIndexer.TxResult,
+        ): TransactionResult = error("no records are produced, so nothing is indexed")
+
+        override suspend fun submitTx(
+            externalSourceToken: ExternalSourceToken?, systemTime: Instant?, writer: suspend (OpenTx) -> TxIndexer.TxResult,
+        ): Deferred<TransactionResult> = error("no records are produced, so nothing is indexed")
+    }
+
+    private suspend fun runLeaderTerm(
+        source: KafkaConnectSource, indexer: TermRecordingIndexer, afterToken: ExternalSourceToken?,
+    ) = coroutineScope {
+        val termsBefore = indexer.termTokens.size
+        val term = launch(Dispatchers.Default) { source.onPartitionAssigned(0, afterToken, UnusedTxIndexer) }
+        eventually(30.seconds) { assertEquals(termsBefore + 1, indexer.termTokens.size, "term begun on the indexer") }
+        term.cancelAndJoin()
+    }
+
     private fun xtQueryDb(node: Xtdb, dbName: String, sql: String): List<Map<String, Any?>> =
         node.createConnectionBuilder().database(dbName).build().use { conn ->
             conn.createStatement().use { stmt ->
@@ -138,6 +182,33 @@ class KafkaConnectSourceIntegrationTest {
                 }
             }
         }
+
+    @Test
+    fun `each leader term begins with the user token of the last indexed transaction`() = runTest(timeout = 180.seconds) {
+        val topic = "test-topic-${UUID.randomUUID()}"
+        createTopic(topic)
+        val indexer = TermRecordingIndexer()
+
+        KafkaCluster.ClusterFactory(kafka.bootstrapServers).open().use { cluster ->
+            val connectConfig = ConnectConfig.parse(mapOf(
+                "key.converter" to "org.apache.kafka.connect.storage.StringConverter",
+                "value.converter" to "org.apache.kafka.connect.storage.StringConverter",
+            ))
+            val source = KafkaConnectSource("termdb", cluster, topic, connectConfig, indexer)
+
+            runLeaderTerm(source, indexer, afterToken = null)
+            runLeaderTerm(source, indexer, afterToken = kafkaConnectSourceToken {
+                offset = -1
+                userToken = ByteString.copyFromUtf8("indexer state")
+            }.toByteArray())
+            runLeaderTerm(source, indexer, afterToken = kafkaConnectSourceToken { offset = -1 }.toByteArray())
+        }
+
+        val (noTransaction, withState, withoutState) = indexer.termTokens
+        assertNull(noTransaction, "no transaction indexed yet")
+        assertEquals("indexer state", withState?.toString(Charsets.UTF_8))
+        assertNull(withoutState, "the last transaction's token carried no user token")
+    }
 
     @Test
     fun `JsonConverter happy path snapshot + streaming`() = runTest(timeout = 120.seconds) {

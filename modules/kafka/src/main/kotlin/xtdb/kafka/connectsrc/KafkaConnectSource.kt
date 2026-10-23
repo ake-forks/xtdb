@@ -146,6 +146,9 @@ class KafkaConnectSource internal constructor(
     ) {
         LOG.info("[$dbName] Partition $partition assigned (topic=$topic)")
 
+        val token = afterToken?.let(KafkaConnectSourceToken::parseFrom)
+        indexer.beginTerm(token?.takeIf { it.hasUserToken() }?.userToken?.toByteArray())
+
         val tags = listOf(
             Tag.of("db", dbName),
             Tag.of("source", topic),
@@ -222,8 +225,8 @@ class KafkaConnectSource internal constructor(
                                     val tp = TopicPartition(topic, partition)
                                     consumer.assign(listOf(tp))
 
-                                    if (afterToken != null) {
-                                        val offset = KafkaConnectSourceToken.parseFrom(afterToken).offset + 1
+                                    if (token != null) {
+                                        val offset = token.offset + 1
                                         LOG.info("[$dbName] Resuming from offset $offset on $topic-$partition")
                                         consumer.seek(tp, offset)
                                     } else {
