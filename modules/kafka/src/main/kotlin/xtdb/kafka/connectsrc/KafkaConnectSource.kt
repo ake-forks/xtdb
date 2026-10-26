@@ -200,6 +200,9 @@ class KafkaConnectSource internal constructor(
             DEFAULT_CONSUMER_CONFIG + cluster.kafkaConfigMap + HARDCODED_CONSUMER_CONFIG
 
         try {
+            val token = afterToken?.let(KafkaConnectSourceToken::parseFrom)
+            indexer.onAssigned(token?.takeIf { it.hasUserToken() }?.let { it.userToken.toByteArray() })
+
             connectConfig.keyConverter.open().use { keyConverter ->
                 connectConfig.valueConverter.open().use { valueConverter ->
                     SimpleHeaderConverter().also { it.configure(emptyMap<String, Any>()) }.use { headerConverter ->
@@ -222,8 +225,8 @@ class KafkaConnectSource internal constructor(
                                     val tp = TopicPartition(topic, partition)
                                     consumer.assign(listOf(tp))
 
-                                    if (afterToken != null) {
-                                        val offset = KafkaConnectSourceToken.parseFrom(afterToken).offset + 1
+                                    if (token != null) {
+                                        val offset = token.offset + 1
                                         LOG.info("[$dbName] Resuming from offset $offset on $topic-$partition")
                                         consumer.seek(tp, offset)
                                     } else {
@@ -291,6 +294,8 @@ class KafkaConnectSource internal constructor(
             LOG.error(e, "[$dbName] External source failed")
             throw e
         } finally {
+            runCatching { indexer.onRevoked() }
+                .onFailure { LOG.error(it, "[$dbName] Indexer revocation failed") }
             meterRegistry?.let { reg -> (gauges + listOfNotNull(recordsCounter, commitLag)).forEach { reg.remove(it) } }
         }
     }
