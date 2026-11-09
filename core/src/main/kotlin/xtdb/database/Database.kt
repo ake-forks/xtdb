@@ -44,7 +44,6 @@ import xtdb.tx.serializeUserMetadata
 import xtdb.tx.toArrowBytes
 import xtdb.util.MsgIdUtil.msgIdToEpoch
 import xtdb.util.MsgIdUtil.msgIdToOffset
-import xtdb.util.MsgIdUtil.offsetToMsgId
 import xtdb.util.closeAll
 import xtdb.util.info
 import xtdb.util.safelyOpening
@@ -285,24 +284,12 @@ class Database(
 
             val storage = PartitionStorage(logs, bufferPool, metadataManager, partition = 0)
             val tableCat = state.tableCatalog.snap()
-            val sourceMsgId = maxOf(
-                tableCat.latestProcessedMsgId ?: -1,
-                offsetToMsgId(logs.sourceLog.epoch, -1)
-            )
-            // tx-id and source-msg-id can diverge under ext-source — seed them independently:
-            // tx-id from the live-index's last committed tx, source-msg-id from the persisted
-            // block-catalog watermark (or the source-log epoch floor on a fresh epoch).
-            val txId = state.liveIndex.state.latestCompletedTx?.txId ?: -1L
 
             // Catch log/storage divergence (rotated/truncated/wrong topic) before we wire up
             // the indexer — see /ops/backup-and-restore/out-of-sync-log.
             validateOffsets(dbName, logs.sourceLog, tableCat.latestProcessedMsgId)
 
-            val watchers = Watchers(
-                latestTxId = txId,
-                latestSourceMsgId = sourceMsgId,
-                externalSourceToken = tableCat.externalSourceToken,
-            )
+            val watchers = state.openWatchers(logs.sourceLog.epoch)
 
             val crashLogger = CrashLogger(allocator, storage.bufferPool, base.config.nodeId)
 

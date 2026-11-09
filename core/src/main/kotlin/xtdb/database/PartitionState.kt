@@ -9,6 +9,7 @@ import org.apache.arrow.memory.BufferAllocator
 import xtdb.api.IndexerConfig
 import xtdb.api.TableRef
 import xtdb.api.TransactionKey
+import xtdb.api.log.Watchers
 import xtdb.api.tx.OpenTx
 import xtdb.arrow.RelationReader
 import xtdb.block.proto.Block
@@ -30,6 +31,7 @@ import xtdb.util.trace
 import xtdb.util.closeAllOnCatch
 import xtdb.table.fromSchemaAndTable
 import xtdb.trie.TrieKey
+import xtdb.util.MsgIdUtil.offsetToMsgId
 import xtdb.util.closeAll
 import xtdb.util.closeOnCatch
 import xtdb.util.error
@@ -66,6 +68,20 @@ class PartitionState private constructor(
     val liveIndex: LiveIndex get() = liveIndexOrNull ?: error("no live-index")
 
     private val snapLock = StampedLock()
+
+    /**
+     * Watchers for a database opening over this partition, seeded from what the partition holds.
+     *
+     * tx-id and source-msg-id can diverge under an external source, so each is seeded independently.
+     */
+    fun openWatchers(sourceEpoch: Int): Watchers {
+        val tableCat = tableCatalog.snap()
+        return Watchers(
+            latestTxId = liveIndex.state.latestCompletedTx?.txId ?: -1L,
+            latestSourceMsgId = maxOf(tableCat.latestProcessedMsgId ?: -1, offsetToMsgId(sourceEpoch, -1)),
+            externalSourceToken = tableCat.externalSourceToken,
+        )
+    }
 
     private val allocator get() = liveIndex.allocator
 
