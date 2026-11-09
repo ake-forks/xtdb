@@ -267,6 +267,7 @@ class PartitionState private constructor(
             allocator: BufferAllocator,
             bufferPool: BufferPool,
             indexerConfig: IndexerConfig = IndexerConfig(),
+            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
         ): PartitionState {
             val tableCatState = TableCatalog.loadState(bufferPool, bufferPool.latestBlock)
                 // xt.txs and xt.role_membership are data-backed, so they're absent from the catalog
@@ -275,7 +276,7 @@ class PartitionState private constructor(
                 .withSeededTable(TableRef("xt", "txs"), listOf("_id", "system_time", "committed", "user_metadata", "error"))
                 .withSeededTable(TableRef("xt", "role_membership"), listOf("user", "role"))
 
-            return open(allocator, PartitionValue.loaded(trieCatalogFactory.open(bufferPool, tableCatState), tableCatState), indexerConfig)
+            return open(allocator, PartitionValue.loaded(trieCatalogFactory.open(bufferPool, tableCatState), tableCatState), indexerConfig, ioDispatcher)
         }
 
         /** A partition starting from [initial], with a live index over it. */
